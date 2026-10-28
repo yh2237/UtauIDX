@@ -1,0 +1,6 @@
+github.com/ebitengine/purego v0.11.2 h1:WWiTx8rD8zYdOwSj8O/NiNbsOvSAgJMTlyV1XlbUSeU=
+github.com/ebitengine/purego v0.11.2/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
+github.com/yh2237/audiodsp v0.5.2 h1:T8+t7FwtS5hAnHFkLVHOhAFxvs9/FaZo/3imEL0GWOo=
+github.com/yh2237/audiodsp v0.5.2/go.mod h1:Cv0D5PXZpjZW/Ty+326DBv2JmdZfu4d6zMhlNOfpWF8=
+github.com/yh2237/gograd v1.8.0 h1:hIVmxjentk/rn92diDT4TA59OlAXHVHHFB9H0+jGUtY=
+github.com/yh2237/gograd v1.8.0/go.mod h1:ACNZET0YGHhzQfw+ixcf5h2bd72MS6P+dl27MSlO61c=
