@@ -17,7 +17,7 @@ import (
 
 const (
 	partMagic   = "UTTPART1"
-	partVersion = 1
+	partVersion = 3
 )
 
 var errBadPart = errors.New("part cache is not usable")
@@ -94,6 +94,7 @@ func encodePart(frames fileFrames) []byte {
 	for _, values := range [][]float32{frames.features, frames.spectrum, frames.aperiodicity, frames.f0} {
 		binary.Write(&buffer, binary.LittleEndian, values)
 	}
+	binary.Write(&buffer, binary.LittleEndian, frames.position)
 	return buffer.Bytes()
 }
 
@@ -130,6 +131,10 @@ func decodePart(data []byte) (fileFrames, error) {
 			return fileFrames{}, errBadPart
 		}
 		*targets[i] = values
+	}
+	result.position = make([]int32, frames)
+	if err := binary.Read(reader, binary.LittleEndian, result.position); err != nil {
+		return fileFrames{}, errBadPart
 	}
 	return result, nil
 }

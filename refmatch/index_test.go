@@ -21,6 +21,7 @@ func TestIndexSaveLoad(t *testing.T) {
 		Aperiodicity: make([]float32, 2*subFrames*2),
 		F0:           []float32{0, 100, 200, 300, 400, 500, 600, 700},
 		File:         []int32{0, 0},
+		Position:     []int32{3, 7},
 	}
 	for i := range index.Spectrum {
 		index.Spectrum[i] = float32(i)
@@ -34,7 +35,7 @@ func TestIndexSaveLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(loaded.Header, index.Header) || !reflect.DeepEqual(loaded.Spectrum, index.Spectrum) ||
-		!reflect.DeepEqual(loaded.F0, index.F0) || !reflect.DeepEqual(loaded.File, index.File) {
+		!reflect.DeepEqual(loaded.F0, index.F0) || !reflect.DeepEqual(loaded.File, index.File) || !reflect.DeepEqual(loaded.Position, index.Position) {
 		t.Fatal("index changed after save and load")
 	}
 	for i, v := range loaded.Features {
@@ -94,12 +95,18 @@ func TestBuildIndexSkipsUnreadableWAV(t *testing.T) {
 		}
 		return values, frames, 3, nil
 	}
-	index, err := BuildIndex(recordingsOf(bad, good), "test", fakeWorld{}, features, nil, nil)
+	recordings := recordingsOf(bad, good)
+	recordings[0].Phoneme = "skipped"
+	recordings[1].Phoneme = "ka"
+	index, err := BuildIndex(recordings, "test", fakeWorld{}, features, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(index.Files, []string{good}) || index.Frames == 0 {
 		t.Fatalf("files %v, frames %d", index.Files, index.Frames)
+	}
+	if !reflect.DeepEqual(index.Phonemes, []string{"ka"}) || !reflect.DeepEqual(index.FilePhonemes, []int32{0}) {
+		t.Fatalf("phonemes %v, file phonemes %v", index.Phonemes, index.FilePhonemes)
 	}
 }
 

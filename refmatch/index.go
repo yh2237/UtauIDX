@@ -31,7 +31,7 @@ const (
 	d4cThreshold   = 0.85
 	quietMarginC0  = 9.0
 	indexMagic     = "UTRM"
-	indexVersion   = 4
+	indexVersion   = 8
 	minimumFileSec = 0.1
 )
 
@@ -55,15 +55,28 @@ type Index struct {
 	Header
 	// Featuresは長さ1に正規化した特徴量（Frames×Dims）。
 	Features []float32
+	// CepstrumはC1〜C20を4つのWORLD行で平均し、単位長にした検索用係数（Frames×CepstrumDims）。
+	Cepstrum []float32
 	// SpectrumはWORLDの包絡の符号（Frames×subFrames×spectrumDims）。
 	Spectrum []float32
 	// AperiodicityはWORLDの非周期性の符号（Frames×subFrames×APBands）。
 	Aperiodicity []float32
 	F0           []float32
 	File         []int32
+	// Positionは静音フレームを除く前の、録音内の20ms位置。
+	Position []int32
 
 	packOnce sync.Once
 	packed   *tensor.PackedB
+}
+
+// WithFeaturesは特徴量だけ差し替えた索引を返す。録音位置などは共有し、検索キャッシュは引き継がない。
+// 呼び出し側は共有した配列を変更しないこと。
+func (index *Index) WithFeatures(features []float32) *Index {
+	return &Index{
+		Header: index.Header, Features: features, Cepstrum: index.Cepstrum, Spectrum: index.Spectrum,
+		Aperiodicity: index.Aperiodicity, F0: index.F0, File: index.File, Position: index.Position,
+	}
 }
 
 type Header struct {
@@ -78,12 +91,17 @@ type Header struct {
 	Files      []string `json:"files"`
 	Source     string   `json:"source"`
 	CacheKey   string   `json:"cache_key,omitempty"`
+	// FilePhonemesはFilesごとの音素ID。-1は音素不明。PhonemesはID順の音素名。
+	FilePhonemes []int32  `json:"file_phonemes,omitempty"`
+	Phonemes     []string `json:"phonemes,omitempty"`
 }
 
 // Recordingは索引に使う録音と、その録音を使う原音のoto.iniの範囲。
 type Recording struct {
 	Path    string
 	Regions []Region
+	// Phonemeは録音の音素名。空なら音素不明として扱う。
+	Phoneme string
 }
 
 // Regionはoto.iniのoffsetとblank（ミリ秒）。blankが負ならoffsetからの長さ、正なら録音の末尾から除く長さ。
@@ -159,6 +177,7 @@ func BuildIndex(recordings []Recording, model string, world World, features Feat
 	}
 	index := &Index{Header: Header{Version: indexVersion, Model: model}}
 	var voicedF0 []float64
+	phonemeIDs := make(map[string]int32)
 	for number, result := range results {
 		if !result.usable {
 			continue
@@ -177,6 +196,7 @@ func BuildIndex(recordings []Recording, model string, world World, features Feat
 		index.Spectrum = append(index.Spectrum, result.spectrum...)
 		index.Aperiodicity = append(index.Aperiodicity, result.aperiodicity...)
 		index.F0 = append(index.F0, result.f0...)
+		index.Position = append(index.Position, result.position...)
 		for range result.frames {
 			index.File = append(index.File, fileID)
 		}
@@ -186,6 +206,17 @@ func BuildIndex(recordings []Recording, model string, world World, features Feat
 				voicedF0 = append(voicedF0, float64(v))
 			}
 		}
+		phonemeID := int32(-1)
+		if phoneme := recordings[number].Phoneme; phoneme != "" {
+			var exists bool
+			phonemeID, exists = phonemeIDs[phoneme]
+			if !exists {
+				phonemeID = int32(len(index.Phonemes))
+				phonemeIDs[phoneme] = phonemeID
+				index.Phonemes = append(index.Phonemes, phoneme)
+			}
+		}
+		index.FilePhonemes = append(index.FilePhonemes, phonemeID)
 		index.Files = append(index.Files, files[number])
 	}
 	if index.Frames == 0 {
@@ -195,6 +226,7 @@ func BuildIndex(recordings []Recording, model string, world World, features Feat
 	// 索引はint8とfloat16で保存する。作った直後と読み直した後で結果が変わらないよう、ここでも丸める。
 	index.Features = quantizeRoundTrip(index.Features, index.Dims)
 	index.Spectrum = roundToHalf(index.Spectrum)
+	index.Cepstrum = cepstrumFromCodes(index.Spectrum, index.Frames)
 	index.Aperiodicity = roundToHalf(index.Aperiodicity)
 	index.F0 = roundToHalf(index.F0)
 	return index, nil
@@ -257,6 +289,7 @@ type fileFrames struct {
 	rate, fftSize, dims, apBands, frames int
 	usable                               bool
 	features, spectrum, aperiodicity, f0 []float32
+	position                             []int32
 }
 
 // analyzeFileは、oto.iniの範囲の外と、95パーセンタイルの音量から約45dB以上小さいフレームを除いて、1ファイル分のフレームを返す。
@@ -405,6 +438,7 @@ func analyzeBytes(data []byte, world World, features FeatureFunc, targetRate int
 		if quiet {
 			continue
 		}
+		result.position = append(result.position, int32(frame))
 		result.features = append(result.features, normalized(values[frame*dims:(frame+1)*dims])...)
 		for sub := range subFrames {
 			row := frame*subFrames + sub
@@ -504,8 +538,24 @@ func (index *Index) Save(path string) error {
 		for i, v := range index.F0 {
 			f0[i] = float32ToHalf(v)
 		}
-		for _, data := range []any{quantized, scales, spectrum, aperiodicity, f0, index.File} {
+		positions := make([]int32, index.Frames)
+		for j := range positions {
+			positions[j] = index.framePosition(j)
+		}
+		for _, data := range []any{quantized, scales, spectrum, aperiodicity, f0, index.File, positions} {
 			if err := binary.Write(buffered, binary.LittleEndian, data); err != nil {
+				return err
+			}
+		}
+		if index.Version >= 7 {
+			cepstrum := index.Cepstrum
+			if len(cepstrum) != index.Frames*CepstrumDims {
+				cepstrum = cepstrumFromCodes(index.Spectrum, index.Frames)
+			}
+			if len(cepstrum) != index.Frames*CepstrumDims {
+				return errors.New("cepstrum and index dimensions do not match")
+			}
+			if err := binary.Write(buffered, binary.LittleEndian, cepstrum); err != nil {
 				return err
 			}
 		}
@@ -544,7 +594,7 @@ func readHeader(reader *bufio.Reader) (Header, error) {
 	return parsed, nil
 }
 
-// Versionは索引の版を返す。版が変わった索引は使えない。
+// Versionは新しく作る索引の版を返す。LoadIndexは音素情報のない第6・7版も読める。
 func Version() int { return indexVersion }
 
 func LoadIndex(path string) (*Index, error) {
@@ -570,7 +620,7 @@ func LoadIndex(path string) (*Index, error) {
 	if err := json.Unmarshal(header, &index.Header); err != nil {
 		return nil, err
 	}
-	if index.Version != indexVersion || index.Frames <= 0 || index.Dims <= 0 || index.APBands <= 0 {
+	if (index.Version != indexVersion && index.Version != 7 && index.Version != 6) || index.Frames <= 0 || index.Dims <= 0 || index.APBands <= 0 {
 		return nil, fmt.Errorf("%s has an unsupported index version", path)
 	}
 	n := index.Frames
@@ -580,9 +630,16 @@ func LoadIndex(path string) (*Index, error) {
 	aperiodicity := make([]uint16, n*subFrames*index.APBands)
 	f0 := make([]uint16, n*subFrames)
 	index.File = make([]int32, n)
-	for _, data := range []any{quantized, scales, spectrum, aperiodicity, f0, index.File} {
+	index.Position = make([]int32, n)
+	for _, data := range []any{quantized, scales, spectrum, aperiodicity, f0, index.File, index.Position} {
 		if err := binary.Read(reader, binary.LittleEndian, data); err != nil {
 			return nil, fmt.Errorf("%s is truncated: %w", path, err)
+		}
+	}
+	if index.Version >= 7 {
+		index.Cepstrum = make([]float32, n*CepstrumDims)
+		if err := binary.Read(reader, binary.LittleEndian, index.Cepstrum); err != nil {
+			return nil, fmt.Errorf("%s has truncated cepstrum: %w", path, err)
 		}
 	}
 	index.Features = dequantizeFeatures(quantized, scales, index.Dims)
