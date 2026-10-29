@@ -68,6 +68,10 @@ type Index struct {
 
 	packOnce sync.Once
 	packed   *tensor.PackedB
+
+	// noiseOnceとnoiseは、フレームごとのノイズらしさ（APの平均）を遅延して作る。
+	noiseOnce sync.Once
+	noise     []float32
 }
 
 // WithFeaturesは特徴量だけ差し替えた索引を返す。録音位置などは共有し、検索キャッシュは引き継がない。

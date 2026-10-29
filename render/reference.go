@@ -10,6 +10,10 @@ import (
 	"github.com/yh2237/gograd/dsp"
 )
 
+// referenceAPUnvoicedは、参照のAPをこの値以上なら無声とみなす閾値。
+// 母音も高域は非周期的なので、摩擦音だけを拾える高さにしてある。
+const referenceAPUnvoiced = 0.75
+
 // Optionsは参照音声からの合成に使う設定。
 type Options struct {
 	// FeatureModeはwavlm（空なら既定）またはcepstrum。
@@ -22,6 +26,11 @@ type Options struct {
 	ContinuityBonus float64
 	// PhonemeFallbackは指定した音素に近い単位が無いとき制約を外す。
 	PhonemeFallback bool
+	// QuietLevelDBは参照の音量がピークからこの値より下がった分だけ出力を下げる。
+	// 0なら既定（40dB）。歌の息を抑えたいときは大きくする。
+	QuietLevelDB float64
+	// ParametersOnlyを真にすると、音声を作らずにWORLDのパラメータだけを返す。
+	ParametersOnly bool
 	// PitchSemitonesは参照から移す半音数。nilなら音源の音域に自動で合わせる。
 	PitchSemitones *float64
 	// TargetPhonemesは20msごとの索引音素ID。nilなら音素で絞らない。
@@ -41,6 +50,8 @@ type Result struct {
 	// F0は出力のF0（5msごと、Hz、0は無声）。
 	F0      []float64
 	Voicing Stats
+	// Parametersは合成に使ったWORLDのパラメータ（ParametersOnlyのときだけ入る）。
+	Parameters *refmatch.Parameters
 }
 
 // FromAudioは参照の音声を分析し、索引のフレームで合成し直す。
@@ -163,12 +174,16 @@ func synthesize(index *refmatch.Index, world refmatch.World, query []float32, fr
 		}
 		// 大きな音の子音を音量だけで有声に戻さない。APが高ければF0があっても無声にする。
 		for i, ap := range referenceAP {
-			if ap >= 0.5 {
+			if ap >= referenceAPUnvoiced {
 				referenceF0[i] = 0
 			}
 		}
 	}
 	stats.After = voicedFrames(referenceF0)
+	// WORLDのF0はオクターブを誤ることがある。参照の旋律をそのまま使うと
+	// 出力の音高が跳ぶので、前後の中央値へ寄せてから使う。
+	correctOctaves(referenceF0)
+	smoothF0(referenceF0)
 	automaticF0 := slices.Clone(referenceF0)
 	for i, hz := range automaticF0 {
 		if hz > 0 {
@@ -180,9 +195,17 @@ func synthesize(index *refmatch.Index, world refmatch.World, query []float32, fr
 		PhonemeFallback: options.PhonemeFallback,
 		Features:        query, Frames: frames, ReferenceF0: referenceF0, OutputF0: automaticF0,
 		ReferenceLevel: levels, ReferenceAP: referenceAP, ContinuityBonus: options.ContinuityBonus,
+		QuietLevelDB: options.QuietLevelDB,
 	}
 	if options.FeatureMode == refmatch.FeatureCepstrum {
 		request.Cepstrum, request.Features = query, nil
+	}
+	if options.ParametersOnly {
+		parameters, err := matched.Parameters(request)
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{SampleRate: matched.SampleRate, F0: automaticF0, Voicing: stats, Parameters: &parameters}, nil
 	}
 	rendered, err := matched.Synthesize(world, request)
 	if err != nil {
@@ -199,14 +222,15 @@ func referenceAPRows(ap []float64, rate, fftSize int, frameMS float64, rows int)
 		return nil, fmt.Errorf("invalid reference AP dimensions")
 	}
 	sourceRows := len(ap) / bins
-	lowBins := min(bins, int(1500*float64(fftSize)/float64(rate))+1)
+	// 子音のノイズは高域に偏るので、低域だけを見ると無声と判定できない。
+	// 全帯域の平均を、有声判定と合成の手がかりにする。
 	means := make([]float64, sourceRows)
 	for row := range sourceRows {
-		for _, value := range ap[row*bins : row*bins+lowBins] {
+		for _, value := range ap[row*bins : row*bins+bins] {
 			if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
 				return nil, fmt.Errorf("invalid reference AP value")
 			}
-			means[row] += value / float64(lowBins)
+			means[row] += value / float64(bins)
 		}
 	}
 	out := make([]float32, rows)
@@ -261,6 +285,69 @@ func voicedFrames(f0 []float64) int {
 		}
 	}
 	return count
+}
+
+// correctOctavesは、前後100msの中央値から600cent以上離れた有声フレームを
+// オクターブ誤りとみなして半分または2倍に寄せる。WORLDのF0は歌声で誤りやすい。
+func correctOctaves(f0 []float64) {
+	const (
+		windowFrames = 20 // 5msフレームで100ms
+		maxCents     = 600.0
+	)
+	original := slices.Clone(f0)
+	for i := range f0 {
+		if original[i] <= 0 {
+			continue
+		}
+		median := localMedian(original, i, windowFrames)
+		if median <= 0 {
+			continue
+		}
+		cents := 1200 * math.Log2(original[i]/median)
+		for cents > maxCents {
+			f0[i] /= 2
+			cents = 1200 * math.Log2(f0[i]/median)
+		}
+		for cents < -maxCents {
+			f0[i] *= 2
+			cents = 1200 * math.Log2(f0[i]/median)
+		}
+	}
+}
+
+// smoothF0は有声フレームのF0を5フレーム（25ms）の中央値で均す。
+// 短い跳びを消し、旋律の形は残す。
+func smoothF0(f0 []float64) {
+	const radius = 2
+	original := slices.Clone(f0)
+	buffer := make([]float64, 0, 2*radius+1)
+	for i := range f0 {
+		if original[i] <= 0 {
+			continue
+		}
+		buffer = buffer[:0]
+		for j := max(0, i-radius); j <= min(len(original)-1, i+radius); j++ {
+			if original[j] > 0 {
+				buffer = append(buffer, original[j])
+			}
+		}
+		slices.Sort(buffer)
+		f0[i] = buffer[len(buffer)/2]
+	}
+}
+
+func localMedian(f0 []float64, center, radius int) float64 {
+	buffer := make([]float64, 0, 2*radius+1)
+	for j := max(0, center-radius); j <= min(len(f0)-1, center+radius); j++ {
+		if f0[j] > 0 {
+			buffer = append(buffer, f0[j])
+		}
+	}
+	if len(buffer) == 0 {
+		return 0
+	}
+	slices.Sort(buffer)
+	return buffer[len(buffer)/2]
 }
 
 // standardizeFeaturesは索引の統計で両側を標準化する。元の索引とその検索キャッシュは変更しない。

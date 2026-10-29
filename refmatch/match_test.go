@@ -12,7 +12,7 @@ func TestQuietCutFollowsReferenceSilence(t *testing.T) {
 		samples[i] = 0.3 * math.Sin(float64(i)*0.05)
 	}
 	levels := ReferenceLevels(samples, rate, rows)
-	cut := quietCut(levels, rows)
+	cut := quietCut(levels, rows, quietLevelDB)
 	if cut[20] > 0.01 {
 		t.Fatalf("loud row cut %.2f dB", cut[20])
 	}
@@ -24,7 +24,7 @@ func TestQuietCutFollowsReferenceSilence(t *testing.T) {
 	if cut[180] < 40 {
 		t.Fatalf("silent row cut %.2f dB, want at least 40", cut[180])
 	}
-	if got := quietCut(nil, rows); got[180] != 0 {
+	if got := quietCut(nil, rows, quietLevelDB); got[180] != 0 {
 		t.Fatal("cut without reference levels")
 	}
 }

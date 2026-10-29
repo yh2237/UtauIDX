@@ -41,20 +41,20 @@ func TestPitchRatioClamps(t *testing.T) {
 	}
 }
 
-func TestReferenceAPRowsUsesLowBands(t *testing.T) {
+func TestReferenceAPRowsUsesAllBands(t *testing.T) {
 	fftSize := 512
 	rate := 44100
 	bins := fftSize/2 + 1
+	// 低域だけ非周期的な行と、全帯域が非周期的な行を作る。
 	ap := make([]float64, bins*2)
 	lowBins := min(bins, int(1500*float64(fftSize)/float64(rate))+1)
-	for row := range 2 {
-		for bin := range bins {
-			if bin < lowBins {
-				ap[row*bins+bin] = 0.25
-			} else {
-				ap[row*bins+bin] = 1
-			}
+	for bin := range bins {
+		if bin < lowBins {
+			ap[bin] = 0.25
+		} else {
+			ap[bin] = 1
 		}
+		ap[bins+bin] = 1
 	}
 	rows, err := referenceAPRows(ap, rate, fftSize, 10, 4)
 	if err != nil {
@@ -63,10 +63,13 @@ func TestReferenceAPRowsUsesLowBands(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("rows = %d, want 4", len(rows))
 	}
-	for _, value := range rows {
-		if math.Abs(float64(value)-0.25) > 1e-6 {
-			t.Fatalf("row value = %v, want 0.25", value)
-		}
+	// 前半の行は高域が1なので、全帯域平均は低域だけの平均より大きい。
+	if float64(rows[0]) <= 0.25+1e-6 {
+		t.Fatalf("row value = %v, want greater than the low-band mean", rows[0])
+	}
+	// 最後の行は全帯域が1の行へ寄るので、ほぼ1になる。
+	if float64(rows[len(rows)-1]) < 0.99 {
+		t.Fatalf("last row = %v, want close to 1", rows[len(rows)-1])
 	}
 }
 

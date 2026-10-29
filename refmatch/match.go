@@ -24,7 +24,13 @@ const (
 	// phonemeFallbackRatioは、音素で絞った最良の類似度が全体の最良に対して
 	// この割合を下回ったら音素の制約を外す目安。
 	phonemeFallbackRatio = 0.8
-	matchBlockRows       = 32
+	// referenceAPNoiseは、参照のAPがこの値以上なら合成のAPを全帯域ノイズにする閾値。
+	// 母音も高域は非周期的なので、摩擦音だけを拾える高さにしてある。
+	referenceAPNoise = 0.75
+	// voicedNoiseLimitは、有声の目標で候補から外すノイズらしさの上限。
+	// 母音は0.1〜0.3、息や摩擦音は0.7以上になる。
+	voicedNoiseLimit = 0.6
+	matchBlockRows   = 32
 )
 
 // Requestは参照音声の特徴量とF0。
@@ -57,6 +63,9 @@ type Request struct {
 	// PhonemeFallbackを真にすると、指定した音素に近い単位が無いフレームで
 	// 音素の制約を外して選び直す（息や物音の単位が混ざるのを防ぐ）。
 	PhonemeFallback bool
+	// QuietLevelDBは、参照の音量がピークからこの値より下がった分だけ出力を下げる。
+	// 0なら既定（40dB）。歌の息を消したいときは大きくする。
+	QuietLevelDB float64
 }
 
 // SelectStatsは最上位候補を5ms単位で追った統計。合成自体は上位4候補の平均を使う。
@@ -218,7 +227,11 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 	decodedAP := make([]float64, rows*bins)
 	sharpened := make([]float64, spectrumDims)
 	before := make([]float64, bins)
-	cut := quietCut(request.ReferenceLevel, rows)
+	quietDB := quietLevelDB
+	if request.QuietLevelDB > 0 {
+		quietDB = request.QuietLevelDB
+	}
+	cut := quietCut(request.ReferenceLevel, rows, quietDB)
 	for row := range rows {
 		coded := spectrum[row*spectrumDims : (row+1)*spectrumDims]
 		c.decodeSpectrum(coded, before)
@@ -242,11 +255,19 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 		}
 		if request.ReferenceAP != nil {
 			reference := float64(request.ReferenceAP[row])
-			// 線形APで(1-w)*単位AP+w*参照APを混ぜる。
-			// AP<=0.2ではw=0.05。有声域(AP<0.5)は単位の比率を過半に保ち、APが高いほど参照へ寄せる（上限1）。
-			weight := 0.05 + 0.95*math.Max(0, math.Min(1, (reference-0.2)/0.8))
-			for i := range ap {
-				ap[i] = (1-weight)*ap[i] + weight*reference
+			if reference >= referenceAPNoise {
+				// 参照が無声（子音）の区間は、単位のAPではなく全帯域をノイズにする。
+				// 低域の平均値へ寄せるだけでは、高域に偏る子音のノイズが出ない。
+				for i := range ap {
+					ap[i] = 1
+				}
+			} else {
+				// 線形APで(1-w)*単位AP+w*参照APを混ぜる。
+				// AP<=0.2ではw=0.05。有声域(AP<0.5)は単位の比率を過半に保ち、APが高いほど参照へ寄せる（上限1）。
+				weight := 0.05 + 0.95*math.Max(0, math.Min(1, (reference-0.2)/0.8))
+				for i := range ap {
+					ap[i] = (1-weight)*ap[i] + weight*reference
+				}
 			}
 		}
 	}
@@ -274,14 +295,14 @@ func ReferenceLevels(samples []float64, sampleRate, rows int) []float64 {
 }
 
 // quietCutは行ごとに出力を下げるdBを返す。
-func quietCut(levels []float64, rows int) []float64 {
+func quietCut(levels []float64, rows int, quietDB float64) []float64 {
 	cut := make([]float64, rows)
 	if len(levels) < rows {
 		return cut
 	}
 	for row := range rows {
-		if levels[row] < -quietLevelDB {
-			cut[row] = math.Min(-quietLevelDB-levels[row], maxQuietCutDB)
+		if levels[row] < -quietDB {
+			cut[row] = math.Min(-quietDB-levels[row], maxQuietCutDB)
 		}
 	}
 	return gaussianFilter(cut, 2)
@@ -364,7 +385,7 @@ func (index *Index) nearestWithPhonemes(features []float32, frames int, queryVoi
 					if targets != nil && available[targets[t]] {
 						target = targets[t]
 					}
-					result[t] = index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback)
+					result[t] = index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback, queryVoiced[t])
 					if bonus != 0 {
 						previous = result[t]
 					}
@@ -384,16 +405,59 @@ func (index *Index) topContext(sim []float32, first, last, t int) []int {
 	return index.topContextWithContinuity(sim, first, last, t, nil, 0)
 }
 
-func (index *Index) topContextWithContinuity(sim []float32, first, last, t int, previous []int, bonus float64) []int {
-	return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false)
+// frameNoiseはフレームごとのノイズらしさ（復号したAPの平均）を返す。
+// 有声の目標に息や子音の単位を当てないための判定に使う。
+func (index *Index) frameNoise() []float32 {
+	index.noiseOnce.Do(func() {
+		index.noise = make([]float32, index.Frames)
+		if index.APBands <= 0 || index.FFTSize < 2 || len(index.Aperiodicity) == 0 {
+			return
+		}
+		bins := index.FFTSize/2 + 1
+		c := newCodec(index.SampleRate, index.FFTSize, bins)
+		decoded := make([]float64, bins)
+		coded := make([]float64, index.APBands)
+		for frame := range index.Frames {
+			var total float64
+			for sub := range subFrames {
+				offset := (frame*subFrames + sub) * index.APBands
+				if offset+index.APBands > len(index.Aperiodicity) {
+					break
+				}
+				for band, value := range index.Aperiodicity[offset : offset+index.APBands] {
+					coded[band] = float64(value)
+				}
+				c.decodeAperiodicity(coded, decoded)
+				var sum float64
+				for _, value := range decoded {
+					sum += value
+				}
+				total += sum / float64(bins)
+			}
+			index.noise[frame] = float32(total / float64(subFrames))
+		}
+	})
+	return index.noise
 }
 
-func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, previous []int, bonus float64, target int32, fallback bool) []int {
+func (index *Index) topContextWithContinuity(sim []float32, first, last, t int, previous []int, bonus float64) []int {
+	return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false, false)
+}
+
+func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, previous []int, bonus float64, target int32, fallback bool, voiced bool) []int {
 	n := index.Frames
 	bestScore := make([]float32, 0, neighbors)
 	best := make([]int, 0, neighbors)
 	bestAll := float32(-1e30)
+	var noise []float32
+	if voiced {
+		noise = index.frameNoise()
+	}
 	for j := range n {
+		// 有声の目標に、息や子音のようなノイズ性の高い単位を当てない。
+		if voiced && len(noise) == n && noise[j] >= voicedNoiseLimit {
+			continue
+		}
 		var total, count float32
 		for delta := -contextFrames; delta <= contextFrames; delta++ {
 			tt, jj := t+delta, j+delta
@@ -442,10 +506,14 @@ func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, pre
 		}
 		best[position], bestScore[position] = j, score
 	}
+	if len(best) == 0 && voiced {
+		// ノイズを避けた結果、候補が残らないときは制約を外す。
+		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback, false)
+	}
 	if fallback && target >= 0 && (len(best) == 0 || bestScore[0] < phonemeFallbackRatio*bestAll) {
 		// 指定した音素に近い単位が無いときは、音素の制約を外して選び直す。
 		// 遠い候補を無理に当てると、息や物音の単位が混ざる。
-		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false)
+		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false, false)
 	}
 	return best
 }
