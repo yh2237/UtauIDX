@@ -11,11 +11,18 @@ import (
 
 const (
 	contextFrames   = 2
-	contextWeight   = 0.5
+	contextWeight   = 0.0
 	neighbors       = 4
 	voicingPenalty  = 0.5
 	smoothingFrames = 3
 	postfilterBeta  = 0.4
+	// rankDecayは、候補をrankDecay^順位の重みで平均する底。等しい重みでは別々の録音が混ざってぼやける。
+	rankDecay = 0.5
+	// crossfadeMSは、隣のフレームの候補も混ぜる三角の重みが0になる距離。20msごとの入れ替わりを目立たせない。
+	crossfadeMS = 30.0
+	// levelTrackDBは、参照がピークからこの値より下がった行で、出力の相対音量が参照を超えた分を下げる閾値。
+	// 静かな子音の位置に、息など大きめの単位が入ったときに浮かないようにする。
+	levelTrackDB = 10.0
 	// 参照の音量がピークからquietLevelDBより下がった分だけ、出力も最大maxQuietCutDBまで下げる。
 	quietLevelDB = 40.0
 	// maxQuietCutDBは、参照が無音に近いところで出力を下げる上限。
@@ -244,6 +251,7 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 		quietDB = request.QuietLevelDB
 	}
 	cut := quietCut(request.ReferenceLevel, rows, quietDB)
+	index.trackLevel(cut, spectrum, request.ReferenceLevel, rows, c, before)
 	for row := range rows {
 		coded := spectrum[row*spectrumDims : (row+1)*spectrumDims]
 		c.decodeSpectrum(coded, before)
@@ -630,20 +638,80 @@ func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, pre
 	return best
 }
 
+// averageは5ms行ごとに、そのフレームと前後のフレームの候補を、中心からの距離の三角の重み（crossfadeMSで0）と
+// 順位の重みで平均する。隣のフレームの候補は、その録音の続きの行を使い、続きが無ければ端の行を使う。
 func (index *Index) average(values []float32, dims int, nearest [][]int, rows int) []float64 {
 	out := make([]float64, rows*dims)
-	for t, chosen := range nearest {
-		for sub := range subFrames {
-			target := out[(t*subFrames+sub)*dims : (t*subFrames+sub+1)*dims]
-			for _, j := range chosen {
-				source := values[(j*subFrames+sub)*dims : (j*subFrames+sub+1)*dims]
-				for d, v := range source {
-					target[d] += float64(v) / float64(len(chosen))
+	frameMS := float64(subFrames) * worldFrameMS
+	reach := int(math.Ceil(crossfadeMS/frameMS)) + 1
+	for row := range rows {
+		t, sub := row/subFrames, row%subFrames
+		at := (float64(sub) + 0.5) * worldFrameMS
+		target := out[row*dims : (row+1)*dims]
+		total := 0.0
+		for f := max(0, t-reach); f <= min(len(nearest)-1, t+reach); f++ {
+			chosen := nearest[f]
+			if len(chosen) == 0 {
+				continue
+			}
+			w := 1 - math.Abs(float64(t-f)*frameMS+at-frameMS/2)/crossfadeMS
+			if w <= 0 {
+				continue
+			}
+			ranks := 0.0
+			for k := range chosen {
+				ranks += math.Pow(rankDecay, float64(k))
+			}
+			for k, j := range chosen {
+				source, s := j, sub
+				if delta := t - f; delta != 0 {
+					next := j + delta
+					if next >= 0 && next < len(index.File) && index.File[next] == index.File[j] && index.framePosition(next) == index.framePosition(j)+int32(delta) {
+						source = next
+					} else if delta > 0 {
+						s = subFrames - 1
+					} else {
+						s = 0
+					}
 				}
+				weight := w * math.Pow(rankDecay, float64(k)) / ranks
+				for d, v := range values[(source*subFrames+s)*dims : (source*subFrames+s+1)*dims] {
+					target[d] += float64(v) * weight
+				}
+			}
+			total += w
+		}
+		if total > 0 {
+			for d := range target {
+				target[d] /= total
 			}
 		}
 	}
 	return out
+}
+
+// trackLevelは、参照がピークからlevelTrackDBより下がった行で、出力の相対音量（95パーセンタイル基準）が
+// 参照を超えた分をcutに足す。差はσ2行でなめらかにする。
+func (index *Index) trackLevel(cut, spectrum, levels []float64, rows int, c *codec, scratch []float64) {
+	if len(levels) < rows {
+		return
+	}
+	outLevel := make([]float64, rows)
+	for row := range rows {
+		c.decodeSpectrum(spectrum[row*spectrumDims:(row+1)*spectrumDims], scratch)
+		outLevel[row] = 10 * math.Log10(sum(scratch)+1e-30)
+	}
+	peak := percentile(outLevel, 95)
+	extra := make([]float64, rows)
+	for row := range rows {
+		if levels[row] < -levelTrackDB {
+			extra[row] = math.Max(0, outLevel[row]-peak-levels[row])
+		}
+	}
+	extra = gaussianFilter(extra, 2)
+	for row := range rows {
+		cut[row] = math.Min(cut[row]+extra[row], maxQuietCutDB)
+	}
 }
 
 // smoothはscipy.ndimage.uniform_filter1d（size 3、reflect）と同じく時間方向に3行の平均をとる。

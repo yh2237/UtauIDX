@@ -131,7 +131,7 @@ func TestPhonemePersistenceAndLegacy(t *testing.T) {
 	}
 }
 
-// These hashes were captured before adding phoneme filtering.
+// These hashes were captured before adding phoneme filtering and updated for rank-weighted crossfade averaging and level tracking.
 func TestUnspecifiedPhonemeBaselineBytes(t *testing.T) {
 	index, request := phonemeFixture()
 	index.Phonemes = []string{"a", "ka", "u"}
@@ -148,9 +148,9 @@ func TestUnspecifiedPhonemeBaselineBytes(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		want := "073e9e517aae452172e9fc69acbef18438fd2efd5ff2a89307629130a2f9aef1"
+		want := "17609c41b976fa51c18c2d5eb49dcf098ece088ad809c1a71b853534d8b4b65c"
 		if bonus != 0 {
-			want = "d727f519198cdf7d33191fe9cb2c7a87ef3bcaeeb172ac377c0a75a375ded4a4"
+			want = "53eb60671b007e87fcb6e759d31242ff535a8055f02673ac9d97bbcee3bcaf88"
 		}
 		if got := fmt.Sprintf("%x", sha256.Sum256(b.Bytes())); got != want {
 			t.Fatalf("bonus %g baseline bytes changed: %s", bonus, got)
