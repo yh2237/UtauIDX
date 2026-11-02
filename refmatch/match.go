@@ -34,9 +34,6 @@ const (
 	// referenceAPNoiseは、参照のAPがこの値以上なら合成のAPを全帯域ノイズにする閾値。
 	// 母音も高域は非周期的なので、摩擦音だけを拾える高さにしてある。
 	referenceAPNoise = 0.75
-	// voicedNoiseLimitは、有声の目標で候補から外すノイズらしさの上限。
-	// 母音は0.1〜0.3、息や摩擦音は0.7以上になる。
-	voicedNoiseLimit = 0.6
 	matchBlockRows   = 32
 )
 
@@ -425,7 +422,7 @@ func (index *Index) nearestWithPhonemes(features []float32, frames int, queryVoi
 					if targets != nil && available[targets[t]] {
 						target = targets[t]
 					}
-					result[t] = index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback, queryVoiced[t])
+					result[t] = index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback)
 					if bonus != 0 {
 						previous = result[t]
 					}
@@ -525,59 +522,16 @@ func (index *Index) topContext(sim []float32, first, last, t int) []int {
 	return index.topContextWithContinuity(sim, first, last, t, nil, 0)
 }
 
-// frameNoiseはフレームごとのノイズらしさ（復号したAPの平均）を返す。
-// 有声の目標に息や子音の単位を当てないための判定に使う。
-func (index *Index) frameNoise() []float32 {
-	index.noiseOnce.Do(func() {
-		index.noise = make([]float32, index.Frames)
-		if index.APBands <= 0 || index.FFTSize < 2 || len(index.Aperiodicity) == 0 {
-			return
-		}
-		bins := index.FFTSize/2 + 1
-		c := newCodec(index.SampleRate, index.FFTSize, bins)
-		decoded := make([]float64, bins)
-		coded := make([]float64, index.APBands)
-		for frame := range index.Frames {
-			var total float64
-			for sub := range subFrames {
-				offset := (frame*subFrames + sub) * index.APBands
-				if offset+index.APBands > len(index.Aperiodicity) {
-					break
-				}
-				for band, value := range index.Aperiodicity[offset : offset+index.APBands] {
-					coded[band] = float64(value)
-				}
-				c.decodeAperiodicity(coded, decoded)
-				var sum float64
-				for _, value := range decoded {
-					sum += value
-				}
-				total += sum / float64(bins)
-			}
-			index.noise[frame] = float32(total / float64(subFrames))
-		}
-	})
-	return index.noise
-}
-
 func (index *Index) topContextWithContinuity(sim []float32, first, last, t int, previous []int, bonus float64) []int {
-	return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false, false)
+	return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false)
 }
 
-func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, previous []int, bonus float64, target int32, fallback bool, voiced bool) []int {
+func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, previous []int, bonus float64, target int32, fallback bool) []int {
 	n := index.Frames
 	bestScore := make([]float32, 0, neighbors)
 	best := make([]int, 0, neighbors)
 	bestAll := float32(-1e30)
-	var noise []float32
-	if voiced {
-		noise = index.frameNoise()
-	}
 	for j := range n {
-		// 有声の目標に、息や子音のようなノイズ性の高い単位を当てない。
-		if voiced && len(noise) == n && noise[j] >= voicedNoiseLimit {
-			continue
-		}
 		var total, count float32
 		for delta := -contextFrames; delta <= contextFrames; delta++ {
 			tt, jj := t+delta, j+delta
@@ -626,14 +580,10 @@ func (index *Index) topContextWithPhoneme(sim []float32, first, last, t int, pre
 		}
 		best[position], bestScore[position] = j, score
 	}
-	if len(best) == 0 && voiced {
-		// ノイズを避けた結果、候補が残らないときは制約を外す。
-		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, target, fallback, false)
-	}
 	if fallback && target >= 0 && (len(best) == 0 || bestScore[0] < phonemeFallbackRatio*bestAll) {
 		// 指定した音素に近い単位が無いときは、音素の制約を外して選び直す。
 		// 遠い候補を無理に当てると、息や物音の単位が混ざる。
-		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false, false)
+		return index.topContextWithPhoneme(sim, first, last, t, previous, bonus, -1, false)
 	}
 	return best
 }
