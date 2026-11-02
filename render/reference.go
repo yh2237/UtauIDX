@@ -29,6 +29,10 @@ type Options struct {
 	// QuietLevelDBは参照の音量がピークからこの値より下がった分だけ出力を下げる。
 	// 0なら既定（40dB）。歌の息を抑えたいときは大きくする。
 	QuietLevelDB float64
+	// SegmentLockは音素の連続区間ごとに録音を1つに固定する。
+	SegmentLock bool
+	// SpectrumSmoothは出力の包絡を時間方向に均す回数。0なら均さない。
+	SpectrumSmooth int
 	// ParametersOnlyを真にすると、音声を作らずにWORLDのパラメータだけを返す。
 	ParametersOnly bool
 	// PitchSemitonesは参照から移す半音数。nilなら音源の音域に自動で合わせる。
@@ -67,6 +71,7 @@ func FromAudio(index *refmatch.Index, world refmatch.World, features refmatch.Fe
 	var frames int
 	var referenceF0, levels []float64
 	var referenceAP []float32
+	var referenceShaped []float32
 
 	if options.FeatureMode == refmatch.FeatureCepstrum {
 		var err error
@@ -82,7 +87,7 @@ func FromAudio(index *refmatch.Index, world refmatch.World, features refmatch.Fe
 		if features == nil {
 			return Result{}, fmt.Errorf("feature function is required for %q", options.FeatureMode)
 		}
-		raw, _, ap, fftSize, err := world.Analyze(audio, sampleRate, refmatch.FrameMS, 0.85)
+		raw, referenceSpectrum, ap, fftSize, err := world.Analyze(audio, sampleRate, refmatch.FrameMS, 0.85)
 		if err != nil {
 			return Result{}, fmt.Errorf("analyze reference: %w", err)
 		}
@@ -105,9 +110,10 @@ func FromAudio(index *refmatch.Index, world refmatch.World, features refmatch.Fe
 			if err != nil {
 				return Result{}, err
 			}
+			referenceShaped = expandRows(toFloat32(referenceSpectrum), fftSize/2+1, frames*refmatch.SubFrames())
 		}
 	}
-	return synthesize(index, world, query, frames, referenceF0, levels, referenceAP, options)
+	return synthesize(index, world, query, frames, referenceF0, levels, referenceAP, referenceShaped, options)
 }
 
 // analyzeCepstrumは参照の包絡から検索用のケプストラムとF0を作る。
@@ -150,7 +156,7 @@ func analyzeCepstrum(index *refmatch.Index, world refmatch.World, samples []floa
 	return cepstrum, frames, referenceF0, referenceAP, nil
 }
 
-func synthesize(index *refmatch.Index, world refmatch.World, query []float32, frames int, referenceF0, levels []float64, referenceAP []float32, options Options) (Result, error) {
+func synthesize(index *refmatch.Index, world refmatch.World, query []float32, frames int, referenceF0, levels []float64, referenceAP, referenceSpectrum []float32, options Options) (Result, error) {
 	ratio, referenceMedian, indexMedian, err := pitchRatio(referenceF0, index.F0, options.PitchSemitones)
 	if err != nil {
 		return Result{}, err
@@ -194,8 +200,10 @@ func synthesize(index *refmatch.Index, world refmatch.World, query []float32, fr
 		FeatureMode: options.FeatureMode, TargetPhonemes: options.TargetPhonemes,
 		PhonemeFallback: options.PhonemeFallback,
 		Features:        query, Frames: frames, ReferenceF0: referenceF0, OutputF0: automaticF0,
-		ReferenceLevel: levels, ReferenceAP: referenceAP, ContinuityBonus: options.ContinuityBonus,
-		QuietLevelDB: options.QuietLevelDB,
+		ReferenceLevel: levels, ReferenceAP: referenceAP, ReferenceSpectrum: referenceSpectrum,
+		ContinuityBonus: options.ContinuityBonus,
+		QuietLevelDB:    options.QuietLevelDB,
+		SpectrumSmooth:  options.SpectrumSmooth, SegmentLock: options.SegmentLock,
 	}
 	if options.FeatureMode == refmatch.FeatureCepstrum {
 		request.Cepstrum, request.Features = query, nil
@@ -275,6 +283,30 @@ func voicedMedian[T ~float32 | ~float64](f0 []T) float64 {
 		return voiced[middle-1]/2 + voiced[middle]/2
 	}
 	return voiced[middle]
+}
+
+func expandRows(values []float32, bins, rows int) []float32 {
+	if bins <= 0 || len(values)%bins != 0 {
+		return nil
+	}
+	source := len(values) / bins
+	if source == 0 || rows <= 0 {
+		return nil
+	}
+	out := make([]float32, rows*bins)
+	for row := range rows {
+		src := row * source / rows
+		copy(out[row*bins:(row+1)*bins], values[src*bins:(src+1)*bins])
+	}
+	return out
+}
+
+func toFloat32(values []float64) []float32 {
+	out := make([]float32, len(values))
+	for i, value := range values {
+		out[i] = float32(value)
+	}
+	return out
 }
 
 func voicedFrames(f0 []float64) int {

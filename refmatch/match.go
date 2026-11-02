@@ -45,6 +45,15 @@ type Request struct {
 	ReferenceF0 []float64
 	// ReferenceAPは5msごとの非周期性（0〜1、低域の平均）。nilなら単位のAPと従来の有声判定を使う。
 	ReferenceAP []float32
+	// ReferenceSpectrumは5msごとの参照の包絡（rows×FFTSize/2+1、線形）。
+	// 子音の区間で包絡の形だけを借りるのに使う。nilなら単位の包絡のまま。
+	ReferenceSpectrum []float32
+	// SegmentLockを真にすると、音素の連続区間ごとに録音を1つに固定する。
+	// 持続音のあいだに単位が入れ替わって音がざらつくのを抑える。
+	SegmentLock bool
+	// SpectrumSmoothは、出力の包絡を時間方向に均す回数。1回で前後5msを含む3点平均。
+	// 持続音でフレームごとの包絡が揺れて聞こえるのを抑える。0なら均さない。
+	SpectrumSmooth int
 	// CenterHzは出力のF0の中心。0なら音源のF0の中央値。
 	CenterHz float64
 	// PitchScaleは参照のF0の動きを何倍にするか。
@@ -198,6 +207,9 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 		}
 	}
 	nearest := index.nearestWithPhonemes(request.Features, request.Frames, frameVoicing(f0), request.ContinuityBonus, request.TargetPhonemes, request.PhonemeFallback)
+	if request.SegmentLock {
+		nearest = index.lockSegments(nearest, request.TargetPhonemes)
+	}
 	if request.SelectStats != nil {
 		*request.SelectStats = index.selectStats(nearest)
 	}
@@ -261,6 +273,23 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 				for i := range ap {
 					ap[i] = 1
 				}
+				if request.ReferenceSpectrum != nil {
+					// 子音は参照の包絡の形（高域の強調）を借りる。全体の大きさは単位に合わせる。
+					ref := request.ReferenceSpectrum[row*bins : (row+1)*bins]
+					var unitSum, refSum float64
+					for i := range after {
+						unitSum += after[i]
+					}
+					for _, value := range ref {
+						refSum += float64(value)
+					}
+					if unitSum > 0 && refSum > 0 {
+						gain := unitSum / refSum
+						for i := range after {
+							after[i] = float64(ref[i]) * gain
+						}
+					}
+				}
 			} else {
 				// 線形APで(1-w)*単位AP+w*参照APを混ぜる。
 				// AP<=0.2ではw=0.05。有声域(AP<0.5)は単位の比率を過半に保ち、APが高いほど参照へ寄せる（上限1）。
@@ -270,6 +299,9 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 				}
 			}
 		}
+	}
+	for range request.SpectrumSmooth {
+		smooth(decodedSpectrum, bins)
 	}
 	return Parameters{F0: outF0, Spectrum: decodedSpectrum, Aperiodicity: decodedAP}, nil
 }
@@ -399,6 +431,86 @@ func (index *Index) nearestWithPhonemes(features []float32, frames int, queryVoi
 	close(blocks)
 	wg.Wait()
 	return result
+}
+
+// lockSegmentsは、音素の連続区間ごとに1つの録音へ選択を固定する。
+// 区間の中で単位が入れ替わると、持続音がざらついて聞こえるため。
+// 録音は、その区間の候補に最も多く現れたものを選ぶ。区間の中の位置は、
+// 選んだ録音のフレームを区間の長さに合わせて順に進める。
+func (index *Index) lockSegments(nearest [][]int, targets []int32) [][]int {
+	if len(nearest) == 0 || len(targets) != len(nearest) {
+		return nearest
+	}
+	positions := index.filePositions()
+	out := make([][]int, len(nearest))
+	copy(out, nearest)
+	for start := 0; start < len(targets); {
+		end := start + 1
+		for end < len(targets) && targets[end] == targets[start] {
+			end++
+		}
+		if targets[start] < 0 {
+			start = end
+			continue
+		}
+		segment := nearest[start:end]
+		counts := map[int32]int{}
+		for _, candidates := range segment {
+			seen := map[int32]bool{}
+			for _, candidate := range candidates {
+				file := index.File[candidate]
+				if file < 0 || seen[file] {
+					continue
+				}
+				seen[file] = true
+				counts[file]++
+			}
+		}
+		best, bestCount := int32(-1), 0
+		for file, count := range counts {
+			if count > bestCount || (count == bestCount && file < best) {
+				best, bestCount = file, count
+			}
+		}
+		if best >= 0 {
+			frames := positions[best]
+			if len(frames) > 0 {
+				// 区間の先頭に対応する録音内の位置から、1フレームずつ進める。
+				// 録音全体を区間へ圧縮すると、早回しになったように聞こえる。
+				startIndex := 0
+				for _, candidate := range nearest[start] {
+					if index.File[candidate] != best {
+						continue
+					}
+					for position, frame := range frames {
+						if frame == candidate {
+							startIndex = position
+							break
+						}
+					}
+					break
+				}
+				for offset := range segment {
+					position := startIndex + offset
+					if position >= len(frames) {
+						position = len(frames) - 1
+					}
+					out[start+offset] = []int{frames[position]}
+				}
+			}
+		}
+		start = end
+	}
+	return out
+}
+
+// filePositionsは録音ごとのフレーム番号を昇順で返す。
+func (index *Index) filePositions() map[int32][]int {
+	positions := make(map[int32][]int)
+	for frame, file := range index.File {
+		positions[file] = append(positions[file], frame)
+	}
+	return positions
 }
 
 func (index *Index) topContext(sim []float32, first, last, t int) []int {
