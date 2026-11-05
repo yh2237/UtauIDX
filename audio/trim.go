@@ -19,6 +19,9 @@ func TrimPCM(pcm *PCM, offsetMs float64, blankMs float64) (*PCM, error) {
 }
 
 func TrimFrames(pcm *PCM, offsetMs float64, blankMs float64) (int, int, error) {
+	if pcm == nil {
+		return 0, 0, errors.New("nil pcm")
+	}
 	if pcm.Channels <= 0 {
 		return 0, 0, errors.New("invalid channel count")
 	}

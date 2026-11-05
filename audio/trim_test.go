@@ -30,3 +30,9 @@ func testPCM(frames int) *PCM {
 	}
 	return &PCM{SampleRate: 1000, Channels: 1, Data: data}
 }
+
+func TestTrimPCMRejectsNil(t *testing.T) {
+	if _, err := TrimPCM(nil, 0, 0); err == nil {
+		t.Fatal("nil PCM accepted")
+	}
+}
