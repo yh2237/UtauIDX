@@ -168,6 +168,9 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 		return Parameters{}, err
 	}
 	if request.FeatureMode == FeatureCepstrum {
+		if err := index.validate(); err != nil {
+			return Parameters{}, err
+		}
 		matched, err := index.cepstrumIndex()
 		if err != nil {
 			return Parameters{}, err
@@ -200,6 +203,9 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 				return Parameters{}, errors.New("reference AP must be finite and between zero and one")
 			}
 		}
+	}
+	if err := index.validate(); err != nil {
+		return Parameters{}, err
 	}
 	f0 := request.ReferenceF0[:rows]
 	if request.ReferenceAP != nil {
@@ -345,7 +351,7 @@ func quietCut(levels []float64, rows int, quietDB float64) []float64 {
 	return gaussianFilter(cut, 2)
 }
 
-func frameVoicing(f0 []float64) []bool {
+func frameVoicing[T ~float32 | ~float64](f0 []T) []bool {
 	voiced := make([]bool, len(f0)/subFrames)
 	for frame := range voiced {
 		count := 0
@@ -383,13 +389,9 @@ func (index *Index) nearestWithPhonemes(features []float32, frames int, queryVoi
 	}
 	query := make([]float32, len(features))
 	for t := range frames {
-		copy(query[t*dims:], normalized(features[t*dims:(t+1)*dims]))
+		normalizeInto(query[t*dims:(t+1)*dims], features[t*dims:(t+1)*dims])
 	}
-	bankF0 := make([]float64, len(index.F0))
-	for i, v := range index.F0 {
-		bankF0[i] = float64(v)
-	}
-	bankVoiced := frameVoicing(bankF0)
+	bankVoiced := frameVoicing(index.F0)
 	packed := index.packedFeatures()
 	result := make([][]int, frames)
 	blocks := make(chan int)
@@ -594,6 +596,15 @@ func (index *Index) average(values []float32, dims int, nearest [][]int, rows in
 	out := make([]float64, rows*dims)
 	frameMS := float64(subFrames) * worldFrameMS
 	reach := int(math.Ceil(crossfadeMS/frameMS)) + 1
+	// 順位の重みは候補の数だけで決まる。行ごとにmath.Powを呼ばずに済むよう先に作る。
+	rankWeights := make([]float64, neighbors)
+	for k := range rankWeights {
+		rankWeights[k] = math.Pow(rankDecay, float64(k))
+	}
+	rankSums := make([]float64, neighbors+1)
+	for k := 1; k <= neighbors; k++ {
+		rankSums[k] = rankSums[k-1] + rankWeights[k-1]
+	}
 	for row := range rows {
 		t, sub := row/subFrames, row%subFrames
 		at := (float64(sub) + 0.5) * worldFrameMS
@@ -608,10 +619,7 @@ func (index *Index) average(values []float32, dims int, nearest [][]int, rows in
 			if w <= 0 {
 				continue
 			}
-			ranks := 0.0
-			for k := range chosen {
-				ranks += math.Pow(rankDecay, float64(k))
-			}
+			ranks := rankSums[len(chosen)]
 			for k, j := range chosen {
 				source, s := j, sub
 				if delta := t - f; delta != 0 {
@@ -624,7 +632,7 @@ func (index *Index) average(values []float32, dims int, nearest [][]int, rows in
 						s = 0
 					}
 				}
-				weight := w * math.Pow(rankDecay, float64(k)) / ranks
+				weight := w * rankWeights[k] / ranks
 				for d, v := range values[(source*subFrames+s)*dims : (source*subFrames+s+1)*dims] {
 					target[d] += float64(v) * weight
 				}
@@ -666,6 +674,9 @@ func (index *Index) trackLevel(cut, spectrum, levels []float64, rows int, c *cod
 
 // smoothはscipy.ndimage.uniform_filter1d（size 3、reflect）と同じく時間方向に3行の平均をとる。
 func smooth(values []float64, dims int) {
+	if dims <= 0 {
+		return
+	}
 	rows := len(values) / dims
 	if rows < 2 {
 		return

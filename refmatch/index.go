@@ -33,6 +33,13 @@ const (
 	indexMagic     = "UTRM"
 	indexVersion   = 8
 	minimumFileSec = 0.1
+	// 索引のヘッダは外部ファイルから読む。配列の長さを決める値に上限を置き、
+	// 壊れたヘッダで巨大な確保や整数の桁あふれを起こさないようにする。
+	maxIndexFrames  = 1 << 30
+	maxIndexDims    = 1 << 20
+	maxIndexAPBands = 1 << 10
+	maxIndexFFTSize = 1 << 20
+	maxIndexRate    = 1 << 20
 )
 
 // SubFramesは1フレームあたりのWORLDの行数を返す。
@@ -361,27 +368,32 @@ func wavInfo(path string) (int, float64, error) {
 		if _, err := io.ReadFull(file, chunk); err != nil {
 			return 0, 0, err
 		}
-		size := int(binary.LittleEndian.Uint32(chunk[4:]))
+		size := int64(binary.LittleEndian.Uint32(chunk[4:]))
 		switch string(chunk[:4]) {
 		case "fmt ":
-			format := make([]byte, size)
+			if size < 16 {
+				return 0, 0, errors.New("bad fmt chunk")
+			}
+			// 先頭16バイトだけ読み、残りはチャンクの大きさに従って読み飛ばす。
+			// 壊れた大きさのfmtチャンクで巨大な領域を確保しない。
+			format := make([]byte, 16)
 			if _, err := io.ReadFull(file, format); err != nil {
 				return 0, 0, err
-			}
-			if len(format) < 16 {
-				return 0, 0, errors.New("bad fmt chunk")
 			}
 			channels = int(binary.LittleEndian.Uint16(format[2:]))
 			rate = int(binary.LittleEndian.Uint32(format[4:]))
 			bits = int(binary.LittleEndian.Uint16(format[14:]))
+			if _, err := file.Seek(size-16+size%2, io.SeekCurrent); err != nil {
+				return 0, 0, err
+			}
 		case "data":
-			bytesPerFrame := channels * (bits / 8)
+			bytesPerFrame := float64(channels) * float64(bits/8)
 			if rate == 0 || bytesPerFrame == 0 {
 				return 0, 0, errors.New("data before fmt")
 			}
-			return rate, float64(size) / float64(bytesPerFrame*rate), nil
+			return rate, float64(size) / (bytesPerFrame * float64(rate)), nil
 		default:
-			if _, err := file.Seek(int64(size+size%2), io.SeekCurrent); err != nil {
+			if _, err := file.Seek(size+size%2, io.SeekCurrent); err != nil {
 				return 0, 0, err
 			}
 		}
@@ -411,16 +423,43 @@ func analyzeBytes(data []byte, world World, features FeatureFunc, targetRate int
 	if err != nil {
 		return result, err
 	}
+	if frames <= 0 || dims <= 0 || len(values) != frames*dims {
+		return result, fmt.Errorf("feature function returned %d frames, %d dimensions, and %d values", frames, dims, len(values))
+	}
 	f0, spectrum, aperiodicity, fftSize, err := world.Analyze(samples, rate, worldFrameMS, d4cThreshold)
 	if err != nil {
 		return result, err
+	}
+	if fftSize < 2 || fftSize%2 != 0 {
+		return result, fmt.Errorf("WORLD returned invalid FFT size %d", fftSize)
 	}
 	c := newCodec(rate, fftSize, spectrumDims)
 	result.usable, result.fftSize, result.dims, result.apBands = true, fftSize, dims, c.apBands
 	bins := fftSize/2 + 1
 	usable := min(frames, len(f0)/subFrames)
-	coded := make([]float64, usable*subFrames*spectrumDims)
-	for i := range usable * subFrames {
+	// WORLD returns subFrames rows per feature frame; the spectrum and
+	// aperiodicity arrays are indexed by those rows, not by feature frames.
+	worldRows, ok := expectedLength(usable, subFrames)
+	if !ok {
+		return result, errors.New("WORLD frame rows overflow")
+	}
+	spectrumRows, ok := expectedLength(worldRows, bins)
+	if !ok || len(spectrum) < spectrumRows {
+		return result, errors.New("WORLD spectrum and frames do not match")
+	}
+	apRows, ok := expectedLength(worldRows, bins)
+	if !ok || len(aperiodicity) < apRows {
+		return result, errors.New("WORLD aperiodicity and frames do not match")
+	}
+	if len(f0) < worldRows {
+		return result, errors.New("WORLD F0 and frames do not match")
+	}
+	codedLen, ok := expectedLength(worldRows, spectrumDims)
+	if !ok {
+		return result, errors.New("WORLD frame rows overflow")
+	}
+	coded := make([]float64, codedLen)
+	for i := range worldRows {
 		c.codeSpectrum(spectrum[i*bins:(i+1)*bins], coded[i*spectrumDims:(i+1)*spectrumDims])
 	}
 	loud := percentile(levels(coded), 95)
@@ -470,6 +509,9 @@ func decodeMono(data []byte) ([]float64, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	if pcm.Channels <= 0 || pcm.SampleRate <= 0 {
+		return nil, 0, errors.New("invalid pcm metadata")
+	}
 	samples := make([]float64, len(pcm.Data)/pcm.Channels)
 	for i := range samples {
 		for c := range pcm.Channels {
@@ -502,20 +544,167 @@ func percentile(values []float64, q float64) float64 {
 }
 
 func normalized(values []float32) []float32 {
+	out := make([]float32, len(values))
+	normalizeInto(out, values)
+	return out
+}
+
+// normalizeIntoはvaluesを単位長にしてdstへ書く。呼び出し側の作業領域を再利用するために分けてある。
+func normalizeInto(dst, values []float32) {
 	var sum float64
 	for _, v := range values {
 		sum += float64(v) * float64(v)
 	}
 	scale := float32(1 / math.Max(math.Sqrt(sum), 1e-12))
-	out := make([]float32, len(values))
 	for i, v := range values {
-		out[i] = v * scale
+		dst[i] = v * scale
 	}
-	return out
+}
+
+// validateHeaderは、配列を確保する前にヘッダだけで索引の形を確かめる。
+func (index *Index) validateHeader() error {
+	if index.Version != indexVersion && index.Version != 7 && index.Version != 6 {
+		return fmt.Errorf("unsupported index version %d", index.Version)
+	}
+	return index.validateShape()
+}
+
+// validateShapeは、版に依存しない索引の形を確かめる。手作りの索引はVersionを
+// 設定しなくても照合できるようにし、保存と読み込みではvalidateHeaderを使う。
+func (index *Index) validateShape() error {
+	if index.Frames <= 0 || index.Frames > maxIndexFrames {
+		return fmt.Errorf("index has %d frames, want 1..%d", index.Frames, maxIndexFrames)
+	}
+	if index.Dims <= 0 || index.Dims > maxIndexDims {
+		return fmt.Errorf("index has %d dimensions, want 1..%d", index.Dims, maxIndexDims)
+	}
+	if index.APBands < 0 || index.APBands > maxIndexAPBands {
+		return fmt.Errorf("index has %d aperiodicity bands, want 0..%d", index.APBands, maxIndexAPBands)
+	}
+	if index.SampleRate <= 0 || index.SampleRate > maxIndexRate {
+		return fmt.Errorf("index has sample rate %d, want 1..%d", index.SampleRate, maxIndexRate)
+	}
+	if index.FFTSize < 2 || index.FFTSize > maxIndexFFTSize || index.FFTSize%2 != 0 {
+		return fmt.Errorf("index has FFT size %d, want an even number in 2..%d", index.FFTSize, maxIndexFFTSize)
+	}
+	return nil
+}
+
+// validateは、保存や照合の前に索引の配列の長さがヘッダと合うことを確かめる。
+func (index *Index) validate() error {
+	if err := index.validateShape(); err != nil {
+		return err
+	}
+	rows, ok := expectedLength(index.Frames, subFrames)
+	if !ok {
+		return errors.New("index frame rows overflow")
+	}
+	for _, check := range []struct {
+		name     string
+		got      int
+		frames   int
+		perFrame int
+	}{
+		{"features", len(index.Features), index.Frames, index.Dims},
+		{"spectrum", len(index.Spectrum), rows, spectrumDims},
+		{"aperiodicity", len(index.Aperiodicity), rows, index.APBands},
+		{"f0", len(index.F0), rows, 1},
+	} {
+		if err := checkLength(check.name, check.got, check.frames, check.perFrame); err != nil {
+			return err
+		}
+	}
+	if err := checkLength("file", len(index.File), index.Frames, 1); err != nil {
+		return err
+	}
+	if len(index.Position) != 0 && len(index.Position) != index.Frames {
+		return fmt.Errorf("index position length %d, want 0 or %d", len(index.Position), index.Frames)
+	}
+	return nil
+}
+
+func expectedLength(frames, perFrame int) (int, bool) {
+	if frames < 0 || perFrame < 0 {
+		return 0, false
+	}
+	if frames != 0 && perFrame > math.MaxInt/frames {
+		return 0, false
+	}
+	return frames * perFrame, true
+}
+
+func checkLength(name string, got, frames, perFrame int) error {
+	want, ok := expectedLength(frames, perFrame)
+	if !ok {
+		return fmt.Errorf("index %s length overflows", name)
+	}
+	if got != want {
+		return fmt.Errorf("index %s length %d, want %d", name, got, want)
+	}
+	return nil
+}
+
+func checkedMul(a, b int64) (int64, bool) {
+	if a < 0 || b < 0 {
+		return 0, false
+	}
+	if a != 0 && b > math.MaxInt64/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func checkedAdd(a, b int64) (int64, bool) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, false
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+// indexPayloadSizeは、ヘッダが宣言する配列のバイト数を返す。読み込み前の長さ確認に使う。
+func indexPayloadSize(header Header) (int64, bool) {
+	n := int64(header.Frames)
+	rows, ok := checkedMul(n, subFrames)
+	if !ok {
+		return 0, false
+	}
+	sizes := []struct{ count, width int64 }{
+		{n, int64(header.Dims)},
+		{n, 4},
+		{rows, spectrumDims * 2},
+		{rows, int64(header.APBands) * 2},
+		{rows, 2},
+		{n, 4},
+		{n, 4},
+	}
+	if header.Version >= 7 {
+		sizes = append(sizes, struct{ count, width int64 }{n, CepstrumDims * 4})
+	}
+	var total int64
+	for _, size := range sizes {
+		bytes, ok := checkedMul(size.count, size.width)
+		if !ok {
+			return 0, false
+		}
+		total, ok = checkedAdd(total, bytes)
+		if !ok {
+			return 0, false
+		}
+	}
+	return total, true
 }
 
 // Saveは索引を書き出す。特徴量は半精度で保存する。
 func (index *Index) Save(path string) error {
+	if err := index.validateHeader(); err != nil {
+		return err
+	}
+	if err := index.validate(); err != nil {
+		return err
+	}
 	header, err := json.Marshal(index.Header)
 	if err != nil {
 		return err
@@ -603,13 +792,17 @@ func LoadIndex(path string) (*Index, error) {
 		return nil, err
 	}
 	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
 	reader := bufio.NewReader(file)
 	magic := make([]byte, len(indexMagic))
 	if _, err := io.ReadFull(reader, magic); err != nil || string(magic) != indexMagic {
 		return nil, fmt.Errorf("%s is not a reference matching index", path)
 	}
 	var length uint32
-	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil || length > 1<<26 {
+	if err := binary.Read(reader, binary.LittleEndian, &length); err != nil || length == 0 || length > 1<<26 {
 		return nil, fmt.Errorf("%s has an invalid header", path)
 	}
 	header := make([]byte, length)
@@ -620,8 +813,15 @@ func LoadIndex(path string) (*Index, error) {
 	if err := json.Unmarshal(header, &index.Header); err != nil {
 		return nil, err
 	}
-	if (index.Version != indexVersion && index.Version != 7 && index.Version != 6) || index.Frames <= 0 || index.Dims <= 0 || index.APBands <= 0 {
-		return nil, fmt.Errorf("%s has an unsupported index version", path)
+	if err := index.validateHeader(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// ヘッダが宣言する配列の長さをファイルの残りと比べ、壊れたヘッダで
+	// 巨大な領域を確保する前に弾く。
+	remaining := stat.Size() - int64(len(indexMagic)) - 4 - int64(length)
+	expected, ok := indexPayloadSize(index.Header)
+	if !ok || remaining < 0 || expected > remaining {
+		return nil, fmt.Errorf("%s is truncated", path)
 	}
 	n := index.Frames
 	quantized := make([]int8, n*index.Dims)
@@ -654,6 +854,9 @@ func LoadIndex(path string) (*Index, error) {
 	index.F0 = make([]float32, len(f0))
 	for i, v := range f0 {
 		index.F0[i] = halfToFloat32(v)
+	}
+	if err := index.validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return index, nil
 }

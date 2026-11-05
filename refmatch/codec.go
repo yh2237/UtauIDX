@@ -26,16 +26,34 @@ type codec struct {
 	decodeFreqAxis      []float64
 	decodeBasis         []float64
 	apBands             int
+	// 作業領域。codecは1回の解析・合成の中で順に使うため、行ごとの確保を避けて再利用する。
+	logSpectrum []float64
+	codeMel     []float64
+	codeV       []float64
+	decodeOut   []float64
+	decodeMel   []float64
+	decodeValue []float64
+	apLog       []float64
+	apAxis      []float64
+	apValues    []float64
+	apFreq      []float64
+	apInterp    []float64
 }
 
 func newCodec(rate, fftSize, dims int) *codec {
 	half := fftSize / 2
 	toMel := func(hz float64) float64 { return melM0 * math.Log(hz/melF0+1) }
 	floor, ceil := toMel(codecFloorHz), toMel(math.Min(float64(rate)/2, codecCeilHz))
+	apBands := max(0, int(math.Min(apUpperLimitHz, float64(rate)/2-apIntervalHz)/apIntervalHz))
 	c := &codec{rate: rate, fftSize: fftSize, dims: dims,
 		codeMelAxis: make([]float64, half), codeFreqAxis: make([]float64, half+1),
 		codeBasis: make([]float64, dims*half), decodeMelAxis: make([]float64, half+2),
-		decodeFreqAxis: make([]float64, half+1), decodeBasis: make([]float64, dims*half)}
+		decodeFreqAxis: make([]float64, half+1), decodeBasis: make([]float64, dims*half),
+		apBands:     apBands,
+		logSpectrum: make([]float64, half+1), codeMel: make([]float64, half), codeV: make([]float64, half),
+		decodeOut: make([]float64, half), decodeMel: make([]float64, half+2), decodeValue: make([]float64, half+1),
+		apLog: make([]float64, half+1), apAxis: make([]float64, apBands+2), apValues: make([]float64, apBands+2),
+		apFreq: make([]float64, half+1), apInterp: make([]float64, half+1)}
 	for i := 0; i < half; i++ {
 		mel := (ceil-floor)*float64(i)/float64(half) + floor
 		c.codeMelAxis[i] = mel
@@ -62,18 +80,21 @@ func newCodec(rate, fftSize, dims int) *codec {
 			c.decodeBasis[k*half+p] = ds * math.Cos(angle+theta)
 		}
 	}
-	c.apBands = int(math.Min(apUpperLimitHz, float64(rate)/2-apIntervalHz) / apIntervalHz)
 	return c
 }
 
 func (c *codec) codeSpectrum(spectrum, coded []float64) {
 	half := c.fftSize / 2
-	logSpectrum := make([]float64, half+1)
+	logSpectrum := c.logSpectrum[:half+1]
 	for i, v := range spectrum[:half+1] {
 		logSpectrum[i] = math.Log(v)
 	}
-	mel := interp1(c.codeFreqAxis, logSpectrum, c.codeMelAxis)
-	v := make([]float64, half)
+	mel := interp1Into(c.codeFreqAxis, logSpectrum, c.codeMelAxis, c.codeMel[:half])
+	v := c.codeV[:half]
+	if half%2 != 0 {
+		// 奇数の半分では下のループが末尾の1要素を書かないため、前回の値を消す。
+		clear(v)
+	}
 	for i := 0; i < half/2; i++ {
 		v[i] = mel[i*2]
 		v[i+half/2] = mel[half-i*2-1]
@@ -90,20 +111,25 @@ func (c *codec) codeSpectrum(spectrum, coded []float64) {
 
 func (c *codec) decodeSpectrum(coded, spectrum []float64) {
 	half := c.fftSize / 2
-	out := make([]float64, half)
+	out := c.decodeOut[:half]
+	clear(out)
 	for k := 0; k < c.dims; k++ {
 		basis := c.decodeBasis[k*half : (k+1)*half]
 		for p := range out {
 			out[p] += coded[k] * basis[p]
 		}
 	}
-	mel := make([]float64, half+2)
+	mel := c.decodeMel[:half+2]
+	if half%2 != 0 {
+		// 奇数の半分では下のループが中央の1要素を書かないため、前回の値を消す。
+		clear(mel)
+	}
 	for i := 0; i < half/2; i++ {
 		mel[1+i*2] = out[i]
 		mel[2+i*2] = out[half-i-1]
 	}
 	mel[0], mel[half+1] = mel[1], mel[half]
-	values := interp1(c.decodeMelAxis, mel, c.decodeFreqAxis)
+	values := interp1Into(c.decodeMelAxis, mel, c.decodeFreqAxis, c.decodeValue[:half+1])
 	for i, v := range values {
 		spectrum[i] = math.Exp(v / float64(half))
 	}
@@ -112,7 +138,7 @@ func (c *codec) decodeSpectrum(coded, spectrum []float64) {
 func (c *codec) codeAperiodicity(aperiodicity, coded []float64) {
 	bins := c.fftSize/2 + 1
 	step := float64(c.rate) / float64(c.fftSize)
-	logAP := make([]float64, bins)
+	logAP := c.apLog[:bins]
 	for i, v := range aperiodicity[:bins] {
 		logAP[i] = 20 * math.Log10(v)
 	}
@@ -133,34 +159,44 @@ func (c *codec) decodeAperiodicity(coded, aperiodicity []float64) {
 	for i := range aperiodicity[:bins] {
 		aperiodicity[i] = 1 - worldSafeGuardMin
 	}
-	var mean float64
-	for _, v := range coded[:c.apBands] {
-		mean += v
+	// 索引のAP帯域数と標本化周波数から決まる帯域数が違う場合も、
+	// 実際にある帯域だけを使って読む。
+	bands := max(0, min(c.apBands, len(coded)))
+	if bands > 0 {
+		var mean float64
+		for _, v := range coded[:bands] {
+			mean += v
+		}
+		if mean/float64(bands) > -0.5 {
+			return
+		}
 	}
-	if mean/float64(c.apBands) > -0.5 {
-		return
-	}
-	axis := make([]float64, c.apBands+2)
-	values := make([]float64, c.apBands+2)
-	for i := 0; i <= c.apBands; i++ {
+	axis := c.apAxis[:bands+2]
+	values := c.apValues[:bands+2]
+	for i := 0; i <= bands; i++ {
 		axis[i] = float64(i) * apIntervalHz
 	}
-	axis[c.apBands+1] = float64(c.rate) / 2
+	axis[bands+1] = float64(c.rate) / 2
 	values[0] = -60
-	copy(values[1:], coded[:c.apBands])
-	values[c.apBands+1] = -worldSafeGuardMin
-	freq := make([]float64, bins)
+	copy(values[1:], coded[:bands])
+	values[bands+1] = -worldSafeGuardMin
+	freq := c.apFreq[:bins]
 	for i := range freq {
 		freq[i] = float64(c.rate) / float64(c.fftSize) * float64(i)
 	}
-	for i, v := range interp1(axis, values, freq) {
+	out := interp1Into(axis, values, freq, c.apInterp[:bins])
+	for i, v := range out {
 		aperiodicity[i] = math.Pow(10, v/20)
 	}
 }
 
 // interp1はWORLDのinterp1と同じく、範囲外を端の区間の傾きで外挿する。
 func interp1(x, y, xi []float64) []float64 {
-	out := make([]float64, len(xi))
+	return interp1Into(x, y, xi, make([]float64, len(xi)))
+}
+
+func interp1Into(x, y, xi, out []float64) []float64 {
+	out = out[:len(xi)]
 	for i, v := range xi {
 		k := sort.Search(len(x), func(j int) bool { return x[j] > v })
 		k = min(max(k, 1), len(x)-1)

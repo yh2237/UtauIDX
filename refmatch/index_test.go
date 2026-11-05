@@ -3,10 +3,12 @@ package refmatch
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yh2237/UtauIDX/audio"
@@ -171,9 +173,9 @@ func TestBuildIndexReusesUnchangedRecordings(t *testing.T) {
 	}
 	files := []string{makeWav("a.wav", 0.1), makeWav("b.wav", 0.2)}
 	cache := OpenPartCache(filepath.Join(t.TempDir(), "parts"))
-	calls := 0
+	var calls atomic.Int32
 	features := func(samples []float64, rate int) ([]float32, int, int, error) {
-		calls++
+		calls.Add(1)
 		frames := len(samples) * 50 / rate
 		values := make([]float32, frames*3)
 		for i := range values {
@@ -185,16 +187,16 @@ func TestBuildIndexReusesUnchangedRecordings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != len(files) {
-		t.Fatalf("first build analyzed %d files", calls)
+	if got := calls.Load(); got != int32(len(files)) {
+		t.Fatalf("first build analyzed %d files", got)
 	}
-	calls = 0
+	calls.Store(0)
 	second, err := BuildIndex(recordingsOf(files...), "test", fakeWorld{}, features, nil, cache)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 0 {
-		t.Fatalf("second build analyzed %d files, want 0", calls)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("second build analyzed %d files, want 0", got)
 	}
 	if first.Frames != second.Frames || !reflect.DeepEqual(first.Features, second.Features) ||
 		!reflect.DeepEqual(first.Spectrum, second.Spectrum) || !reflect.DeepEqual(first.Aperiodicity, second.Aperiodicity) ||
@@ -204,12 +206,12 @@ func TestBuildIndexReusesUnchangedRecordings(t *testing.T) {
 	if err := audio.WriteWav(files[0], &audio.PCM{SampleRate: 16000, Channels: 1, Data: make([]int16, 9000)}); err != nil {
 		t.Fatal(err)
 	}
-	calls = 0
+	calls.Store(0)
 	if _, err := BuildIndex(recordingsOf(files...), "test", fakeWorld{}, features, nil, cache); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 {
-		t.Fatalf("build after one change analyzed %d files, want 1", calls)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("build after one change analyzed %d files, want 1", got)
 	}
 }
 
@@ -288,5 +290,271 @@ func TestBuildIndexSkipsFramesOutsideAliases(t *testing.T) {
 	}
 	if want := 400 / int(FrameMS); part.Frames != want || whole.Frames <= part.Frames {
 		t.Fatalf("frames: whole %d, aliased %d, want %d", whole.Frames, part.Frames, want)
+	}
+}
+
+func writeIndexHeader(t *testing.T, header Header) string {
+	t.Helper()
+	data, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "index.idx")
+	contents := append([]byte(indexMagic), make([]byte, 4)...)
+	binary.LittleEndian.PutUint32(contents[4:], uint32(len(data)))
+	contents = append(contents, data...)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadIndexRejectsHugeHeaderWithoutPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("LoadIndex panicked on a malformed header: %v", r)
+		}
+	}()
+	for _, header := range []Header{
+		{Version: indexVersion, SampleRate: 44100, FFTSize: 2048, APBands: 1, Dims: 1 << 30, Frames: 1 << 30},
+		{Version: indexVersion, SampleRate: 44100, FFTSize: 2048, APBands: 1, Dims: 1, Frames: 1 << 30},
+	} {
+		if _, err := LoadIndex(writeIndexHeader(t, header)); err == nil {
+			t.Fatalf("accepted header %+v", header)
+		}
+	}
+}
+
+func TestLoadIndexRejectsInvalidHeader(t *testing.T) {
+	base := Header{Version: indexVersion, SampleRate: 44100, FFTSize: 2048, APBands: 5, Dims: 1, Frames: 1}
+	for _, test := range []struct {
+		name   string
+		mutate func(*Header)
+	}{
+		{"version", func(h *Header) { h.Version = 5 }},
+		{"sample rate", func(h *Header) { h.SampleRate = 0 }},
+		{"fft size zero", func(h *Header) { h.FFTSize = 0 }},
+		{"fft size odd", func(h *Header) { h.FFTSize = 3 }},
+		{"ap bands", func(h *Header) { h.APBands = -1 }},
+		{"frames", func(h *Header) { h.Frames = 0 }},
+		{"dims", func(h *Header) { h.Dims = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := base
+			test.mutate(&header)
+			if _, err := LoadIndex(writeIndexHeader(t, header)); err == nil {
+				t.Fatalf("accepted header %+v", header)
+			}
+		})
+	}
+}
+
+func TestLoadIndexRejectsTruncatedPayload(t *testing.T) {
+	header := Header{Version: indexVersion, SampleRate: 16000, FFTSize: 512, APBands: 1, Dims: 1, Frames: 1}
+	if _, err := LoadIndex(writeIndexHeader(t, header)); err == nil {
+		t.Fatal("accepted an index without its payload")
+	}
+}
+
+func validTestIndex() *Index {
+	return &Index{
+		Header:   Header{Version: indexVersion, SampleRate: 16000, FFTSize: 512, APBands: 1, Dims: 1, Frames: 1, F0Median: 200},
+		Features: []float32{1}, Spectrum: make([]float32, subFrames*spectrumDims),
+		Aperiodicity: make([]float32, subFrames), F0: []float32{200, 200, 200, 200},
+		File: []int32{0}, Position: []int32{0},
+	}
+}
+
+func TestSaveRejectsInconsistentIndex(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Index)
+	}{
+		{"features", func(index *Index) { index.Features = nil }},
+		{"spectrum", func(index *Index) { index.Spectrum = nil }},
+		{"aperiodicity", func(index *Index) { index.Aperiodicity = nil }},
+		{"f0", func(index *Index) { index.F0 = nil }},
+		{"file", func(index *Index) { index.File = nil }},
+		{"position", func(index *Index) { index.Position = []int32{0, 0} }},
+		{"sample rate", func(index *Index) { index.SampleRate = 0 }},
+		{"fft size", func(index *Index) { index.FFTSize = 0 }},
+		{"version", func(index *Index) { index.Version = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			index := validTestIndex()
+			test.mutate(index)
+			path := filepath.Join(t.TempDir(), "bad.idx")
+			if err := index.Save(path); err == nil {
+				t.Fatal("saved an inconsistent index")
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("failed save left a file: %v", err)
+			}
+		})
+	}
+}
+
+func TestParametersRejectsInvalidIndex(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Index)
+	}{
+		{"features", func(index *Index) { index.Features = nil }},
+		{"file", func(index *Index) { index.File = nil }},
+		{"position", func(index *Index) { index.Position = []int32{0, 0} }},
+		{"sample rate", func(index *Index) { index.SampleRate = 0 }},
+		{"fft size", func(index *Index) { index.FFTSize = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			index := validTestIndex()
+			test.mutate(index)
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Parameters panicked: %v", r)
+				}
+			}()
+			request := Request{Features: []float32{1}, Frames: 1, ReferenceF0: []float64{200, 200, 200, 200}}
+			if _, err := index.Parameters(request); err == nil {
+				t.Fatal("accepted an inconsistent index")
+			}
+		})
+	}
+}
+
+func TestParametersWithoutAperiodicityBands(t *testing.T) {
+	index := &Index{
+		Header:   Header{SampleRate: 8000, FFTSize: 1024, APBands: 0, Dims: 1, Frames: 1, F0Median: 200},
+		Features: []float32{1}, Spectrum: make([]float32, subFrames*spectrumDims),
+		F0: []float32{200, 200, 200, 200}, File: []int32{0}, Position: []int32{0},
+	}
+	request := Request{Features: []float32{1}, Frames: 1, ReferenceF0: []float64{200, 200, 200, 200}}
+	parameters, err := index.Parameters(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bins := index.FFTSize/2 + 1
+	if len(parameters.Aperiodicity) != subFrames*bins {
+		t.Fatalf("aperiodicity length %d, want %d", len(parameters.Aperiodicity), subFrames*bins)
+	}
+	for i, value := range parameters.Aperiodicity {
+		if math.IsNaN(value) || value < 0 || value > 1 {
+			t.Fatalf("aperiodicity[%d] = %v", i, value)
+		}
+	}
+}
+
+func TestBuildIndexLowRateRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "low.wav")
+	pcm := &audio.PCM{SampleRate: 8000, Channels: 1, Data: make([]int16, 8000)}
+	for i := range pcm.Data {
+		pcm.Data[i] = int16(8000 * math.Sin(float64(i)*0.1))
+	}
+	if err := audio.WriteWav(path, pcm); err != nil {
+		t.Fatal(err)
+	}
+	features := func(samples []float64, rate int) ([]float32, int, int, error) {
+		frames := len(samples) * 50 / rate
+		values := make([]float32, frames*3)
+		for i := range values {
+			values[i] = float32(i%3 + 1)
+		}
+		return values, frames, 3, nil
+	}
+	index, err := BuildIndex(recordingsOf(path), "test", fakeWorld{}, features, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index.APBands != 0 {
+		t.Fatalf("8 kHz index has %d aperiodicity bands, want 0", index.APBands)
+	}
+	indexPath := filepath.Join(t.TempDir(), "low.idx")
+	if err := index.Save(indexPath); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadIndex(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.F0Median = 200
+	request := Request{Features: []float32{1, 1, 1}, Frames: 1, ReferenceF0: []float64{200, 200, 200, 200}}
+	if _, err := loaded.Parameters(request); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type invalidFFTWorld struct{ fakeWorld }
+
+func (invalidFFTWorld) Analyze(samples []float64, rate int, frameMS, threshold float64) ([]float64, []float64, []float64, int, error) {
+	f0, spectrum, aperiodicity, _, err := fakeWorld{}.Analyze(samples, rate, frameMS, threshold)
+	return f0, spectrum, aperiodicity, 3, err
+}
+
+func TestBuildIndexRejectsInconsistentAnalyzer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "voice.wav")
+	pcm := &audio.PCM{SampleRate: 16000, Channels: 1, Data: make([]int16, 16000)}
+	for i := range pcm.Data {
+		pcm.Data[i] = int16(8000 * math.Sin(float64(i)*0.1))
+	}
+	if err := audio.WriteWav(path, pcm); err != nil {
+		t.Fatal(err)
+	}
+	validFeatures := func(samples []float64, rate int) ([]float32, int, int, error) {
+		frames := len(samples) * 50 / rate
+		return make([]float32, frames*3), frames, 3, nil
+	}
+	if _, err := BuildIndex(recordingsOf(path), "test", invalidFFTWorld{}, validFeatures, nil, nil); err == nil {
+		t.Fatal("accepted an odd FFT size")
+	}
+	badFeatures := func([]float64, int) ([]float32, int, int, error) {
+		return []float32{1}, 2, 3, nil
+	}
+	if _, err := BuildIndex(recordingsOf(path), "test", fakeWorld{}, badFeatures, nil, nil); err == nil {
+		t.Fatal("accepted inconsistent feature dimensions")
+	}
+}
+
+type shortWorld struct {
+	fft, f0Rows, spectrumRows, apRows int
+}
+
+func (w shortWorld) Analyze([]float64, int, float64, float64) ([]float64, []float64, []float64, int, error) {
+	return make([]float64, w.f0Rows), make([]float64, w.spectrumRows), make([]float64, w.apRows), w.fft, nil
+}
+
+func (shortWorld) Synthesize([]float64, []float64, []float64, int, int, float64) ([]float64, error) {
+	return nil, nil
+}
+
+// WORLD returns subFrames rows per feature frame. A spectrum or aperiodicity
+// array with usable*bins values passes a feature-frame check but is four times
+// too short for the row loop.
+func TestAnalyzeBytesRejectsShortWorldRows(t *testing.T) {
+	data := audio.PCMToWavBytes(&audio.PCM{SampleRate: 16000, Channels: 1, Data: make([]int16, 3200)})
+	if data == nil {
+		t.Fatal("encode WAV fixture")
+	}
+	features := func([]float64, int) ([]float32, int, int, error) {
+		return []float32{1, 1}, 2, 1, nil
+	}
+	const fft = 256
+	bins := fft/2 + 1
+	for _, test := range []struct {
+		name                 string
+		spectrumRows, apRows int
+	}{
+		{"spectrum", 2 * bins, 8 * bins},
+		{"aperiodicity", 8 * bins, 2 * bins},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("analyzeBytes panicked: %v", recovered)
+				}
+			}()
+			world := shortWorld{fft: fft, f0Rows: 8, spectrumRows: test.spectrumRows, apRows: test.apRows}
+			if _, err := analyzeBytes(data, world, features, 0, 0, 1000); err == nil {
+				t.Fatal("accepted short WORLD rows")
+			}
+		})
 	}
 }

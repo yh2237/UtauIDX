@@ -49,12 +49,18 @@ func partKey(model string, data []byte, rate int, start, end float64) string {
 }
 
 func (c *PartCache) path(key string) string {
+	if len(key) < 2 {
+		return ""
+	}
 	return filepath.Join(c.dir, key[:2], key+".part")
 }
 
 // Loadは保存した解析結果を返す。ないか読めなければfalse。
 func (c *PartCache) Load(key string) (fileFrames, bool) {
 	path := c.path(key)
+	if path == "" {
+		return fileFrames{}, false
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fileFrames{}, false
@@ -72,6 +78,9 @@ func (c *PartCache) Load(key string) (fileFrames, bool) {
 // Saveは解析結果を保存する。失敗しても索引の作成は続ける。
 func (c *PartCache) Save(key string, frames fileFrames) {
 	path := c.path(key)
+	if path == "" {
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
@@ -111,7 +120,16 @@ func decodePart(data []byte) (fileFrames, error) {
 		}
 	}
 	version, usable, rate, fftSize, dims, apBands, frames := header[0], header[1], header[2], header[3], header[4], header[5], header[6]
-	if version != partVersion || frames > 1<<24 || dims > 1<<12 || apBands > 1<<10 {
+	if version != partVersion || usable > 1 || frames > 1<<24 || dims > 1<<12 || apBands > 1<<10 {
+		return fileFrames{}, errBadPart
+	}
+	if usable == 1 && (rate == 0 || rate > maxIndexRate || fftSize < 2 || fftSize > maxIndexFFTSize || fftSize%2 != 0 || dims == 0 || frames == 0) {
+		return fileFrames{}, errBadPart
+	}
+	// 宣言された配列の長さを実際の残りと比べ、壊れたキャッシュで
+	// 巨大な領域を確保する前に弾く。
+	expected, ok := partPayloadSize(frames, dims, apBands)
+	if !ok || expected > int64(reader.Len()) {
 		return fileFrames{}, errBadPart
 	}
 	result := fileFrames{
@@ -137,4 +155,32 @@ func decodePart(data []byte) (fileFrames, error) {
 		return fileFrames{}, errBadPart
 	}
 	return result, nil
+}
+
+// partPayloadSizeは、キャッシュのヘッダが宣言する配列のバイト数を返す。
+func partPayloadSize(frames, dims, apBands uint32) (int64, bool) {
+	n := int64(frames)
+	rows, ok := checkedMul(n, subFrames)
+	if !ok {
+		return 0, false
+	}
+	sizes := []struct{ count, width int64 }{
+		{n, int64(dims) * 4},
+		{rows, spectrumDims * 4},
+		{rows, int64(apBands) * 4},
+		{rows, 4},
+		{n, 4},
+	}
+	var total int64
+	for _, size := range sizes {
+		bytes, ok := checkedMul(size.count, size.width)
+		if !ok {
+			return 0, false
+		}
+		total, ok = checkedAdd(total, bytes)
+		if !ok {
+			return 0, false
+		}
+	}
+	return total, true
 }
