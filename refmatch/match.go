@@ -79,6 +79,10 @@ type Request struct {
 	// QuietLevelDBは、参照の音量がピークからこの値より下がった分だけ出力を下げる。
 	// 0なら既定（40dB）。歌の息を消したいときは大きくする。
 	QuietLevelDB float64
+	// Unblendedを真にすると、最上位の候補だけを使い、前後3行の平均と包絡の強調をしない。
+	// 隣のフレームとの重ね合わせ（crossfadeMS）は残る。
+	// 録音どうしの音が大きく違う音源では、候補を混ぜるとこもって聞こえる。
+	Unblended bool
 }
 
 // SelectStatsは最上位候補を5ms単位で追った統計。合成自体は上位4候補の平均を使う。
@@ -223,10 +227,21 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 	if request.SelectStats != nil {
 		*request.SelectStats = index.selectStats(nearest)
 	}
+	beta := postfilterBeta
+	if request.Unblended {
+		beta = 0
+		for f, chosen := range nearest {
+			if len(chosen) > 1 {
+				nearest[f] = chosen[:1]
+			}
+		}
+	}
 	spectrum := index.average(index.Spectrum, spectrumDims, nearest, rows)
 	aperiodicity := index.average(index.Aperiodicity, index.APBands, nearest, rows)
-	smooth(spectrum, spectrumDims)
-	smooth(aperiodicity, index.APBands)
+	if !request.Unblended {
+		smooth(spectrum, spectrumDims)
+		smooth(aperiodicity, index.APBands)
+	}
 
 	c := newCodec(index.SampleRate, index.FFTSize, spectrumDims)
 	bins := index.FFTSize/2 + 1
@@ -260,7 +275,7 @@ func (index *Index) Parameters(request Request) (Parameters, error) {
 		c.decodeSpectrum(coded, before)
 		copy(sharpened, coded)
 		for k := 2; k < spectrumDims; k++ {
-			sharpened[k] *= 1 + postfilterBeta
+			sharpened[k] *= 1 + beta
 		}
 		after := decodedSpectrum[row*bins : (row+1)*bins]
 		c.decodeSpectrum(sharpened, after)
