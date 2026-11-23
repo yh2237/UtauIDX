@@ -1,7 +1,6 @@
 package audio
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -11,11 +10,7 @@ import (
 	"github.com/yh2237/UtauIDX/atomicfile"
 )
 
-type PCM struct {
-	SampleRate int
-	Channels   int
-	Data       []int16
-}
+type PCM = wav.PCM
 
 func ReadWav(path string) (*PCM, error) {
 	file, err := os.Open(path)
@@ -28,14 +23,7 @@ func ReadWav(path string) (*PCM, error) {
 }
 
 func DecodeWav(input io.Reader) (*PCM, error) {
-	data, err := io.ReadAll(input)
-	if err != nil {
-		return nil, err
-	}
-	if pcm, err := wav.Decode(bytes.NewReader(data)); err == nil {
-		return (*PCM)(pcm), nil
-	}
-	return decodeExtendedWav(data)
+	return wav.Decode(input)
 }
 
 func WriteWav(path string, pcm *PCM) error {
@@ -47,7 +35,7 @@ func WriteWav(path string, pcm *PCM) error {
 	}
 
 	return atomicfile.Write(path, func(file io.Writer) error {
-		return wav.Encode(file, (*wav.PCM)(pcm))
+		return wav.Encode(file, pcm)
 	})
 }
 
@@ -56,7 +44,7 @@ func PCMToWavBytes(pcm *PCM) []byte {
 	if err := validatePCM(pcm); err != nil {
 		return nil
 	}
-	data, err := wav.Bytes((*wav.PCM)(pcm))
+	data, err := wav.Bytes(pcm)
 	if err != nil {
 		return nil
 	}
