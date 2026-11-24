@@ -39,9 +39,11 @@ func AutoSynthConfig(profile matcher.AutoProfile) SynthConfig {
 	if profile.IsRawPool && !profile.IsSinusoidal {
 		return SynthConfig{
 			LevelTrackDB:   10,
-			CrossfadeMS:    30,
-			PostfilterBeta: 0.40,
-			BetaMode:       BetaFull,
+			MaxSupportDB:   2.5,
+			CrossfadeMS:    26,
+			UnvoicedCFMS:   14,
+			PostfilterBeta: 0.08,
+			BetaMode:       BetaLowOrder,
 			QuietLevelDB:   40,
 		}
 	}

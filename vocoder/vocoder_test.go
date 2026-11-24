@@ -69,9 +69,11 @@ func TestAutoSynthConfig(t *testing.T) {
 func TestAutoSynthConfigRawPool(t *testing.T) {
 	want := SynthConfig{
 		LevelTrackDB:   10,
-		CrossfadeMS:    30,
-		PostfilterBeta: 0.40,
-		BetaMode:       BetaFull,
+		MaxSupportDB:   2.5,
+		CrossfadeMS:    26,
+		UnvoicedCFMS:   14,
+		PostfilterBeta: 0.08,
+		BetaMode:       BetaLowOrder,
 		QuietLevelDB:   40,
 	}
 	got := AutoSynthConfig(matcher.AutoProfile{Gap: 0.4, IsRawPool: true})

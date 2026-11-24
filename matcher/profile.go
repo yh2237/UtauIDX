@@ -114,7 +114,7 @@ func ComputeAutoProfile(idx *index.Index, query Query) AutoProfile {
 	p.IsRawPool = !p.IsSinusoidal && isPureRawPool(idx)
 	if p.IsRawPool {
 		p.ContinuityBonus = 0.05
-		p.RankDecay = 0.50
+		p.RankDecay = 0.20
 		if primary != "" {
 			p.ChannelWeights[primary] = 1
 		}

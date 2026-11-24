@@ -313,7 +313,7 @@ func TestComputeAutoProfileRawPool(t *testing.T) {
 		MouthDelta:  make([]float32, worldcodec.MouthDims),
 	}
 	p := ComputeAutoProfile(idx, q)
-	if !p.IsRawPool || p.IsSinusoidal || p.ContinuityBonus != 0.05 || p.RankDecay != 0.50 ||
+	if !p.IsRawPool || p.IsSinusoidal || p.ContinuityBonus != 0.05 || p.RankDecay != 0.20 ||
 		p.ContextWeight != 0 || p.GlitchScale != 0 || p.Xling != 0 ||
 		len(p.ChannelWeights) != 1 || p.ChannelWeights[wavlm] != 1 {
 		t.Fatalf("unexpected raw-pool profile %+v", p)
@@ -322,5 +322,5 @@ func TestComputeAutoProfileRawPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkNear(t, got.Weights[0][1]/got.Weights[0][0], 0.50, 1e-12)
+	checkNear(t, got.Weights[0][1]/got.Weights[0][0], 0.20, 1e-12)
 }
