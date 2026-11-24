@@ -55,6 +55,7 @@ type Entry struct {
 type BankProfile struct {
 	TotalOtoEntries, UsableUnits, SampleRate int
 	Topology                                 string
+	P90SpanMS                                float64
 	IsSmallJPCV                              bool
 }
 
@@ -153,14 +154,18 @@ func ScanRawVoicebank(bankDir string) ([]Entry, BankProfile, error) {
 	sort.Strings(paths)
 
 	var spanMS float64
+	spans := make([]float64, 0, len(paths))
 	kanaCount := 0
 	for _, path := range paths {
 		rec := recordings[path]
-		spanMS += rec.end - rec.start
+		span := rec.end - rec.start
+		spanMS += span
+		spans = append(spans, span)
 		if kanaRe.MatchString(fileStem(path)) {
 			kanaCount++
 		}
 	}
+	profile.P90SpanMS = p90Float64(spans)
 	profile.IsSmallJPCV = spanMS < 120_000 && kanaCount*5 >= len(paths)*3
 
 	entries := make([]Entry, 0, len(paths))
@@ -170,6 +175,60 @@ func ScanRawVoicebank(bankDir string) ([]Entry, BankProfile, error) {
 		entries = append(entries, entry)
 	}
 	return entries, profile, nil
+}
+
+// MeasureEntries estimates total usable 20 ms frames and the 90th-percentile
+// recording span in milliseconds for the given entries.
+func MeasureEntries(entries []Entry) (frames int, p90SpanMS float64) {
+	const (
+		frameMS       = 20.0
+		minimumFileMS = 100.0
+	)
+	spans := make([]float64, 0, len(entries))
+	for _, entry := range entries {
+		pcm, err := wav.ReadFile(entry.Path)
+		if err != nil || pcm.Channels <= 0 || pcm.SampleRate <= 0 {
+			continue
+		}
+		durationMS := float64(len(pcm.Data)/pcm.Channels) * 1000 / float64(pcm.SampleRate)
+		if durationMS < minimumFileMS {
+			continue
+		}
+		start, end := recordingSpan(entry.Regions, durationMS)
+		if end <= start {
+			continue
+		}
+		span := end - start
+		frames += int(span / frameMS)
+		spans = append(spans, span)
+	}
+	return frames, p90Float64(spans)
+}
+
+func recordingSpan(regions []Region, durMS float64) (start, end float64) {
+	start, end = math.Inf(1), math.Inf(-1)
+	for _, region := range regions {
+		last := durMS - region.Blank
+		if region.Blank < 0 {
+			last = region.Offset - region.Blank
+		}
+		if last > region.Offset {
+			start, end = min(start, region.Offset), max(end, last)
+		}
+	}
+	if start >= end {
+		return 0, durMS
+	}
+	return max(start, 0), min(end, durMS)
+}
+
+func p90Float64(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), vals...)
+	sort.Float64s(sorted)
+	return sorted[min(len(sorted)-1, int(0.90*float64(len(sorted))))]
 }
 
 func modalSampleRate(counts map[int]int) int {

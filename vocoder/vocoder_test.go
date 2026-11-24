@@ -66,6 +66,25 @@ func TestAutoSynthConfig(t *testing.T) {
 	}
 }
 
+func TestAutoSynthConfigRawPool(t *testing.T) {
+	want := SynthConfig{
+		LevelTrackDB:   10,
+		CrossfadeMS:    30,
+		PostfilterBeta: 0.40,
+		BetaMode:       BetaFull,
+		QuietLevelDB:   40,
+	}
+	got := AutoSynthConfig(matcher.AutoProfile{Gap: 0.4, IsRawPool: true})
+	if got != want {
+		t.Fatalf("raw pool config = %+v, want %+v", got, want)
+	}
+	// IsSinusoidal takes precedence and stays on the non-human babble/Step 21c path.
+	sinGot := AutoSynthConfig(matcher.AutoProfile{Gap: 0.4, IsRawPool: true, IsSinusoidal: true})
+	if sinGot.BetaMode != BetaMidOrder || !sinGot.APCliffGuard {
+		t.Fatalf("sinusoidal fallback = %+v", sinGot)
+	}
+}
+
 func TestAnalyzeReference(t *testing.T) {
 	const fft, frames, rate = 512, 3, 22050
 	const bins, rows = fft/2 + 1, frames * index.SubFrames

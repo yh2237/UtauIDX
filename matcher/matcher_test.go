@@ -294,3 +294,33 @@ func TestBlendWeights(t *testing.T) {
 		checkNear(t, w[0]+w[1], 1, 1e-12)
 	}
 }
+
+func TestComputeAutoProfileRawPool(t *testing.T) {
+	es, wh := encoder.IDWav2Vec2EspeakL20, encoder.IDWhisperSmallL12PosInv
+	idx := testIndex(4, wavlm, es, wh)
+	idx.Files = []index.FileEntry{{Path: "a.wav", Layer: speechpool.LayerRaw}, {Path: "b.wav", Layer: speechpool.LayerRaw}}
+	idx.MouthStatic = make([]float32, 4*worldcodec.MouthDims)
+	idx.MouthDelta = make([]float32, 4*worldcodec.MouthDims)
+	for _, id := range []string{wavlm, es, wh} {
+		for f := range idx.Frames {
+			idx.Channels[id][f*2] = 1
+		}
+	}
+	q := Query{
+		Frames:      1,
+		Channels:    map[string][]float32{wavlm: {1, 0}, es: {1, 0}, wh: {1, 0}},
+		MouthStatic: make([]float32, worldcodec.MouthDims),
+		MouthDelta:  make([]float32, worldcodec.MouthDims),
+	}
+	p := ComputeAutoProfile(idx, q)
+	if !p.IsRawPool || p.IsSinusoidal || p.ContinuityBonus != 0.05 || p.RankDecay != 0.50 ||
+		p.ContextWeight != 0 || p.GlitchScale != 0 || p.Xling != 0 ||
+		len(p.ChannelWeights) != 1 || p.ChannelWeights[wavlm] != 1 {
+		t.Fatalf("unexpected raw-pool profile %+v", p)
+	}
+	got, err := Match(idx, q, Options{Profile: &p, TopK: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNear(t, got.Weights[0][1]/got.Weights[0][0], 0.50, 1e-12)
+}

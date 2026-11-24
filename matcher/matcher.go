@@ -126,15 +126,15 @@ func Match(idx *index.Index, query Query, opts Options) (*Result, error) {
 		value float64
 	}{
 		{"continuity bonus", profile.ContinuityBonus}, {"context weight", profile.ContextWeight},
-		{"glitch scale", profile.GlitchScale}, {"tail penalty", opts.TailPenalty},
-		{"rank decay", opts.RankDecay}, {"similarity temperature", opts.SimTemp},
-		{"candidate cepstrum sigma", opts.CandCepSigma},
+		{"glitch scale", profile.GlitchScale}, {"rank decay", profile.RankDecay},
+		{"tail penalty", opts.TailPenalty}, {"rank decay", opts.RankDecay},
+		{"similarity temperature", opts.SimTemp}, {"candidate cepstrum sigma", opts.CandCepSigma},
 	} {
 		if !finiteNonnegative(opt.value) {
 			return nil, fmt.Errorf("matcher: invalid %s", opt.name)
 		}
 	}
-	if opts.TopK < 0 || opts.RankDecay > 1 {
+	if opts.TopK < 0 || opts.RankDecay > 1 || profile.RankDecay > 1 {
 		return nil, fmt.Errorf("matcher: invalid top K or rank decay")
 	}
 	topK := min(opts.TopK, DefaultTopK)
@@ -142,7 +142,11 @@ func Match(idx *index.Index, query Query, opts Options) (*Result, error) {
 		topK = DefaultTopK
 	}
 	if opts.RankDecay == 0 {
-		opts.RankDecay = DefaultRankDecay
+		if profile.RankDecay > 0 {
+			opts.RankDecay = profile.RankDecay
+		} else {
+			opts.RankDecay = DefaultRankDecay
+		}
 	}
 
 	result := &Result{

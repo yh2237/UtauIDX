@@ -101,7 +101,7 @@ func TestScanRawVoicebankCV(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantProfile := BankProfile{
-		TotalOtoEntries: 14, UsableUnits: 5, SampleRate: rate, Topology: "cv-diverse", IsSmallJPCV: true,
+		TotalOtoEntries: 14, UsableUnits: 5, SampleRate: rate, Topology: "cv-diverse", P90SpanMS: 500, IsSmallJPCV: true,
 	}
 	if profile != wantProfile {
 		t.Fatalf("profile = %+v, want %+v", profile, wantProfile)
@@ -159,7 +159,7 @@ func TestScanRawVoicebankVCV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := BankProfile{TotalOtoEntries: 84, UsableUnits: 42, SampleRate: rate, Topology: "diphone-graph"}
+	want := BankProfile{TotalOtoEntries: 84, UsableUnits: 42, SampleRate: rate, Topology: "diphone-graph", P90SpanMS: 6275}
 	if profile != want || len(entries) != 2 || len(entries[0].Regions) != 42 || len(entries[1].Regions) != 42 {
 		t.Fatalf("profile = %+v, entry count = %d, want %+v and two raw takes", profile, len(entries), want)
 	}
@@ -185,5 +185,24 @@ func TestScanRawVoicebankDurationThreshold(t *testing.T) {
 	}
 	if profile.IsSmallJPCV || len(entries) != 1 || entries[0].Penalty != 0 {
 		t.Errorf("profile = %+v, entries = %+v", profile, entries)
+	}
+}
+
+func TestMeasureEntries(t *testing.T) {
+	dir := t.TempDir()
+	const rate = 16000
+	aWav := filepath.Join(dir, "a.wav")
+	bWav := filepath.Join(dir, "b.wav")
+	shortWav := filepath.Join(dir, "short.wav")
+	writeTestTone(t, aWav, rate, rate*3, 0.18)      // 3000 ms
+	writeTestTone(t, bWav, rate, rate/2, 0.18)      // 500 ms
+	writeTestTone(t, shortWav, rate, rate/20, 0.18) // 50 ms (< 100 ms skipped)
+	frames, p90 := MeasureEntries([]Entry{
+		{Path: aWav, Regions: []Region{{Offset: 100, Blank: -2000}}}, // span 2000 ms -> 100 fr
+		{Path: bWav, Regions: []Region{{Offset: 0, Blank: 100}}},     // span 400 ms -> 20 fr
+		{Path: shortWav},
+	})
+	if frames != 120 || p90 != 2000 {
+		t.Fatalf("MeasureEntries = (%d, %v), want (120, 2000)", frames, p90)
 	}
 }

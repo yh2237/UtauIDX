@@ -34,8 +34,17 @@ type SynthConfig struct {
 	QuietLevelDB    float64
 }
 
-// AutoSynthConfig derives the Step 21c settings from the matching profile.
+// AutoSynthConfig derives synthesis settings from the matching profile.
 func AutoSynthConfig(profile matcher.AutoProfile) SynthConfig {
+	if profile.IsRawPool && !profile.IsSinusoidal {
+		return SynthConfig{
+			LevelTrackDB:   10,
+			CrossfadeMS:    30,
+			PostfilterBeta: 0.40,
+			BetaMode:       BetaFull,
+			QuietLevelDB:   40,
+		}
+	}
 	gap, isSin := profile.Gap, profile.IsSinusoidal
 	cfg := SynthConfig{
 		UseSafeRefAP:    gap >= 0.25,

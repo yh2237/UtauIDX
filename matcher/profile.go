@@ -8,6 +8,7 @@ import (
 	"github.com/yh2237/UtauIDX/encoder"
 	"github.com/yh2237/UtauIDX/index"
 	"github.com/yh2237/UtauIDX/internal/worldcodec"
+	"github.com/yh2237/UtauIDX/speechpool"
 	"github.com/yh2237/gograd/tensor"
 )
 
@@ -40,10 +41,12 @@ type AutoProfile struct {
 	Gap             float64
 	Xling           float64
 	IsSinusoidal    bool
+	IsRawPool       bool
 	ChannelWeights  map[string]float64
 	ContextWeight   float64
 	GlitchScale     float64
 	ContinuityBonus float64
+	RankDecay       float64
 }
 
 // ComputeCos1 returns the mean of the highest bank cosine for each query row.
@@ -108,6 +111,15 @@ func ComputeAutoProfile(idx *index.Index, query Query) AutoProfile {
 	p.SizeGap = clip01((4.0 - math.Log10(float64(max(idx.Frames, 500)))) / 0.80)
 	p.Gap = clip01(p.SimGap + 0.25*p.SizeGap)
 	p.IsSinusoidal = idx.C35 > 1.25
+	p.IsRawPool = !p.IsSinusoidal && isPureRawPool(idx)
+	if p.IsRawPool {
+		p.ContinuityBonus = 0.05
+		p.RankDecay = 0.50
+		if primary != "" {
+			p.ChannelWeights[primary] = 1
+		}
+		return p
+	}
 	p.ContextWeight = 0.05 * max(0, 1-p.Gap/0.25)
 	p.GlitchScale = max(0, 1-p.Gap/0.35)
 
@@ -151,6 +163,18 @@ func ComputeAutoProfile(idx *index.Index, query Query) AutoProfile {
 	ids := sortedChannelIDs(p.ChannelWeights)
 	normalizeWeights(p.ChannelWeights, ids)
 	return p
+}
+
+func isPureRawPool(idx *index.Index) bool {
+	if idx == nil || len(idx.Files) == 0 {
+		return false
+	}
+	for _, f := range idx.Files {
+		if f.Layer != speechpool.LayerRaw {
+			return false
+		}
+	}
+	return true
 }
 
 func clip01(x float64) float64 { return min(max(0, x), 1) }

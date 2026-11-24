@@ -6,7 +6,11 @@ func ResolvePoolMode(mode PoolMode, profile BankProfile, rawFrames int, rawC35 f
 	case PoolBabbleOnly, PoolMerge, PoolRawOnly:
 		return mode
 	}
-	if profile.Topology == topologyCV || rawFrames < 8000 || rawC35 > 1.25 {
+	shortRecordings := profile.P90SpanMS < 1100
+	if profile.P90SpanMS <= 0 {
+		shortRecordings = profile.Topology == topologyCV
+	}
+	if shortRecordings || rawFrames < 8000 || rawC35 > 1.25 {
 		return PoolBabbleOnly
 	}
 	return PoolRawOnly
