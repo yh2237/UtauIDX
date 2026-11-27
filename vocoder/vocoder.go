@@ -22,6 +22,7 @@ type SynthConfig struct {
 	BodySupportDB   float64
 	LevelTrackDB    float64
 	MaxSupportDB    float64
+	SoftKneeLevel   bool
 	CrossfadeMS     float64
 	UnvoicedCFMS    float64
 	PostfilterBeta  float64
@@ -38,8 +39,8 @@ type SynthConfig struct {
 func AutoSynthConfig(profile matcher.AutoProfile) SynthConfig {
 	if profile.IsRawPool && !profile.IsSinusoidal {
 		return SynthConfig{
-			LevelTrackDB:   10,
-			MaxSupportDB:   2.5,
+			MaxSupportDB:   8.5,
+			SoftKneeLevel:  true,
 			CrossfadeMS:    26,
 			UnvoicedCFMS:   14,
 			PostfilterBeta: 0.08,

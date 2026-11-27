@@ -68,8 +68,8 @@ func TestAutoSynthConfig(t *testing.T) {
 
 func TestAutoSynthConfigRawPool(t *testing.T) {
 	want := SynthConfig{
-		LevelTrackDB:   10,
-		MaxSupportDB:   2.5,
+		MaxSupportDB:   8.5,
+		SoftKneeLevel:  true,
 		CrossfadeMS:    26,
 		UnvoicedCFMS:   14,
 		PostfilterBeta: 0.08,
@@ -82,7 +82,7 @@ func TestAutoSynthConfigRawPool(t *testing.T) {
 	}
 	// IsSinusoidal takes precedence and stays on the non-human babble/Step 21c path.
 	sinGot := AutoSynthConfig(matcher.AutoProfile{Gap: 0.4, IsRawPool: true, IsSinusoidal: true})
-	if sinGot.BetaMode != BetaMidOrder || !sinGot.APCliffGuard {
+	if sinGot.BetaMode != BetaMidOrder || !sinGot.APCliffGuard || sinGot.SoftKneeLevel {
 		t.Fatalf("sinusoidal fallback = %+v", sinGot)
 	}
 }
@@ -361,5 +361,104 @@ func TestLevelTrackingAndQuietCut(t *testing.T) {
 	near(t, cut[0], 80)
 	if cut[rows-1] > -3.8 || cut[rows-1] < -4 {
 		t.Fatalf("unexpected support gain %v dB", -cut[rows-1])
+	}
+}
+
+func TestSoftKneeLevelSupport(t *testing.T) {
+	const rows, bins = 40, 65
+	makeFlat := func(db float64) []float64 {
+		sp := make([]float64, rows*bins)
+		v := math.Pow(10, db/10.0) / bins
+		for r := range rows {
+			for b := range bins {
+				sp[r*bins+b] = v
+			}
+		}
+		return sp
+	}
+	f0 := make([]float64, rows)
+	levels := make([]float64, rows)
+	for r := range rows {
+		f0[r] = 220
+		levels[r] = -3
+	}
+	// Rows 20..25 simulate a voiced energy sag relative to peak (ref=-12, relOut=-22).
+	sp := makeFlat(0)
+	for r := 20; r <= 25; r++ {
+		levels[r] = -12
+		v := math.Pow(10, -22.0/10.0) / bins
+		for b := range bins {
+			sp[r*bins+b] = v
+		}
+	}
+	// Row 10 simulates unvoiced energy sag capped at min(MaxSupportDB, 3.5) = 3.5 dB.
+	f0[10] = 0
+	levels[10] = -10
+	for b := range bins {
+		sp[10*bins+b] = math.Pow(10, -25.0/10.0) / bins
+	}
+	beforeUnvoiced := sum(sp[10*bins : 11*bins])
+	beforeVoiced := sum(sp[22*bins : 23*bins])
+	applySoftKneeLevel(sp, bins, f0, levels, 8.5)
+	unvoicedGainDB := 10 * math.Log10(sum(sp[10*bins:11*bins])/beforeUnvoiced)
+	voicedGainDB := 10 * math.Log10(sum(sp[22*bins:23*bins])/beforeVoiced)
+	if unvoicedGainDB <= 0 || unvoicedGainDB > 3.55 {
+		t.Fatalf("unvoiced soft-knee gain = %.3f dB, want (0, 3.5]", unvoicedGainDB)
+	}
+	if voicedGainDB < 5.0 || voicedGainDB > 8.55 {
+		t.Fatalf("voiced soft-knee gain = %.3f dB, want [5.0, 8.5]", voicedGainDB)
+	}
+
+	// Verify continuous transition across -30..-18 dB ramp boundaries (no abrupt jump > 0.5 dB per 0.5 dB step).
+	rampSP := makeFlat(0)
+	rampF0 := make([]float64, rows)
+	rampLevels := make([]float64, rows)
+	for r := range rows {
+		rampF0[r] = 220
+		rampLevels[r] = -36.0 + float64(r)*0.6
+		if rampLevels[r] < -12 {
+			v := math.Pow(10, (rampLevels[r]-4.0)/10.0) / bins
+			for b := range bins {
+				rampSP[r*bins+b] = v
+			}
+		}
+	}
+	beforeRamp := make([]float64, rows)
+	for r := range rows {
+		beforeRamp[r] = 10 * math.Log10(sum(rampSP[r*bins:(r+1)*bins]))
+	}
+	applySoftKneeLevel(rampSP, bins, rampF0, rampLevels, 8.5)
+	prevDelta := 0.0
+	for r := 1; r < rows; r++ {
+		gain := 10*math.Log10(sum(rampSP[r*bins:(r+1)*bins])) - beforeRamp[r]
+		if r > 1 && math.Abs(gain-prevDelta) > 0.6 {
+			t.Fatalf("discontinuous gain jump at ref=%.1f dB: %.3f -> %.3f dB", rampLevels[r], prevDelta, gain)
+		}
+		prevDelta = gain
+	}
+
+	// Verify WorldVocoder.Parameters preserves quietCut when SoftKneeLevel is enabled.
+	idx := vocoderIndex()
+	match := &matcher.Result{Frames: 4, Nearest: [][]int{{0}, {0}, {0}, {0}}, Weights: [][]float64{{1}, {1}, {1}, {1}}}
+	cfg := SynthConfig{MaxSupportDB: 8.5, SoftKneeLevel: true, CrossfadeMS: 26, UnvoicedCFMS: 14, PostfilterBeta: 0.08, BetaMode: BetaLowOrder, QuietLevelDB: 40}
+	reqF0 := make([]float64, 16)
+	reqLvl := make([]float64, 16)
+	for r := range 16 {
+		reqF0[r] = 220
+		if r < 4 {
+			reqLvl[r] = -160
+		}
+	}
+	params, err := (&WorldVocoder{}).Parameters(idx, match, SynthRequest{
+		ReferenceF0: reqF0, OutputF0: slices.Clone(reqF0), ReferenceLevel: reqLvl, Config: &cfg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outBins := idx.FFTSize/2 + 1
+	quietDB := 10 * math.Log10(sum(params.Spectrum[:outBins])/float64(outBins))
+	activeDB := 10 * math.Log10(sum(params.Spectrum[12*outBins:13*outBins])/float64(outBins))
+	if activeDB-quietDB < 50 {
+		t.Fatalf("expected quietCut attenuation >= 50 dB with SoftKneeLevel, got active=%.2f quiet=%.2f", activeDB, quietDB)
 	}
 }

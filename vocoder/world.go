@@ -115,7 +115,9 @@ func (v *WorldVocoder) Parameters(idx *index.Index, match *matcher.Result, req S
 		quietDB = 40
 	}
 	cut := quietCut(req.ReferenceLevel, rows, quietDB)
-	trackLevelWithSupportAndTrack(cut, spectrum, req.ReferenceLevel, c, before, cfg.MaxSupportDB, cfg.LevelTrackDB)
+	if !cfg.SoftKneeLevel {
+		trackLevelWithSupportAndTrack(cut, spectrum, req.ReferenceLevel, c, before, cfg.MaxSupportDB, cfg.LevelTrackDB)
+	}
 	presence := presenceCurve(bins, idx.SampleRate, cfg.PresenceDB)
 
 	params := WorldParameters{
@@ -146,6 +148,9 @@ func (v *WorldVocoder) Parameters(idx *index.Index, match *matcher.Result, req S
 		} else {
 			c.DecodeAperiodicity(ap[row*idx.APBands:(row+1)*idx.APBands], apRow)
 		}
+	}
+	if cfg.SoftKneeLevel {
+		applySoftKneeLevel(params.Spectrum, bins, outF0, req.ReferenceLevel, cfg.MaxSupportDB)
 	}
 	applyVoicedBodySupport(params.Spectrum, bins, idx.SampleRate, outF0, req.ReferenceLevel, cfg.BodySupportDB)
 	for range cfg.SpectrumSmooth {
@@ -420,6 +425,65 @@ func trackLevelWithSupportAndTrack(cut, spectrum, levels []float64, c *worldcode
 			s = support[row]
 		}
 		cut[row] = math.Max(-maxSupportDB, math.Min(cut[row]+extra[row]-s, maxQuietCutDB))
+	}
+}
+
+// applySoftKneeLevel gently compresses voiced energy sag upward while keeping quiet gating intact.
+func applySoftKneeLevel(decodedSpectrum []float64, bins int, outF0, levels []float64, maxSupportDB float64) {
+	rows := len(outF0)
+	if rows == 0 || bins <= 0 || len(levels) < rows || len(decodedSpectrum) < rows*bins {
+		return
+	}
+	outDB := make([]float64, rows)
+	var voicedDB []float64
+	for r := range rows {
+		outDB[r] = 10 * math.Log10(sum(decodedSpectrum[r*bins:(r+1)*bins])+1e-30)
+		if outF0[r] > 0 && levels[r] > -25 {
+			voicedDB = append(voicedDB, outDB[r])
+		}
+	}
+	if len(voicedDB) < 3 {
+		for r := range rows {
+			if levels[r] > -25 {
+				voicedDB = append(voicedDB, outDB[r])
+			}
+		}
+	}
+	if len(voicedDB) == 0 {
+		return
+	}
+	outPeak := worldcodec.Percentile(voicedDB, 95)
+	unvoicedCap := min(maxSupportDB, 3.5)
+	gDB := make([]float64, rows)
+	for r := range rows {
+		relOut := outDB[r] - outPeak
+		tgt := levels[r]
+		if outF0[r] > 0 && levels[r] > -30 {
+			softTgt := math.Max(-11.5, math.Min(0.0, -3.0+0.55*(levels[r]+3.0)))
+			if levels[r] < -18 {
+				ramp := (levels[r] + 30.0) / 12.0
+				tgt = levels[r] + ramp*(softTgt-levels[r])
+			} else {
+				tgt = softTgt
+			}
+		}
+		if levels[r] > -30 && relOut > -36 && relOut < tgt {
+			capDB := unvoicedCap
+			if outF0[r] > 0 {
+				capDB = maxSupportDB
+			}
+			gDB[r] = math.Min(0.85*(tgt-relOut), capDB)
+		} else if levels[r] < -12 && relOut > tgt {
+			gDB[r] = math.Max(-(relOut-tgt)*0.85, -18.0)
+		}
+	}
+	gDB = worldcodec.GaussianFilter(gDB, 3.0)
+	for r := range rows {
+		scale := math.Pow(10, gDB[r]/10.0)
+		spRow := decodedSpectrum[r*bins : (r+1)*bins]
+		for b := range bins {
+			spRow[b] *= scale
+		}
 	}
 }
 
