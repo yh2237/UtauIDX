@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/yh2237/UtauIDX/encoder"
@@ -121,7 +122,7 @@ func Build(entries []speechpool.Entry, world World, encoders []encoder.Encoder, 
 		}
 		entry := entries[i]
 		fid := int32(len(idx.Files))
-		idx.Files = append(idx.Files, FileEntry{Path: entry.Path, Layer: entry.Layer, Penalty: entry.Penalty})
+		idx.Files = append(idx.Files, FileEntry{Path: entry.Path, Layer: entry.Layer, Penalty: entry.Penalty, Reversed: entry.Reversed})
 		idx.Frames += part.UsableFrames
 		idx.Spectrum = append(idx.Spectrum, part.Spectrum...)
 		idx.Aperiodicity = append(idx.Aperiodicity, part.Aperiodicity...)
@@ -152,7 +153,7 @@ func Build(entries []speechpool.Entry, world World, encoders []encoder.Encoder, 
 }
 
 func buildRecording(entry speechpool.Entry, world World, models []buildEncoder, cache *PartCache, rate int) (buildPart, error) {
-	audio, err := readRecording(entry.Path)
+	audio, err := readRecording(entry.Path, entry.Reversed)
 	if err != nil {
 		return buildPart{}, nil
 	}
@@ -181,7 +182,11 @@ func buildRecording(entry speechpool.Entry, world World, models []buildEncoder, 
 	if limit == 0 {
 		return buildPart{}, nil
 	}
-	start, end := RecordingSpan(entry.Regions, float64(len(audio.samples))*1000/float64(audio.rate))
+	durMS := float64(len(audio.samples)) * 1000 / float64(audio.rate)
+	start, end := RecordingSpan(entry.Regions, durMS)
+	if entry.Reversed {
+		start, end = max(0, durMS-end), min(durMS, durMS-start)
+	}
 	part, err := loadOrAnalyzeWorld(world, audio, cache, rate, start, end)
 	if err != nil || !part.Usable {
 		return buildPart{}, err
@@ -207,13 +212,14 @@ func buildRecording(entry speechpool.Entry, world World, models []buildEncoder, 
 }
 
 type recordingAudio struct {
-	data    []byte
-	samples []float64
-	rate    int
-	wav16k  []float32
+	data     []byte
+	samples  []float64
+	rate     int
+	reversed bool
+	wav16k   []float32
 }
 
-func readRecording(path string) (*recordingAudio, error) {
+func readRecording(path string, reversed bool) (*recordingAudio, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -233,7 +239,10 @@ func readRecording(path string) (*recordingAudio, error) {
 		}
 		samples[i] = sum / (32768 * float64(pcm.Channels))
 	}
-	return &recordingAudio{data: data, samples: samples, rate: pcm.SampleRate}, nil
+	if reversed {
+		slices.Reverse(samples)
+	}
+	return &recordingAudio{data: data, samples: samples, rate: pcm.SampleRate, reversed: reversed}, nil
 }
 
 func (audio *recordingAudio) resample(rate int) []float32 {
@@ -250,7 +259,7 @@ func (audio *recordingAudio) resample(rate int) []float32 {
 func loadOrExtractChannel(model buildEncoder, audio *recordingAudio, cache *PartCache) (ChannelPart, error) {
 	var key string
 	if cache != nil {
-		key = channelKey(audio.data, model.meta.ID)
+		key = channelKey(audio.data, model.meta.ID, audio.reversed)
 		if part, ok := cache.loadChannel(key, model.meta.Dims); ok {
 			return part, nil
 		}
@@ -281,7 +290,7 @@ func (part ChannelPart) row(position int) []float32 {
 func loadOrAnalyzeWorld(world World, audio *recordingAudio, cache *PartCache, rate int, startMS, endMS float64) (WorldPart, error) {
 	var key string
 	if cache != nil {
-		key = worldKey(audio.data, rate, startMS, endMS)
+		key = worldKey(audio.data, rate, startMS, endMS, audio.reversed)
 		if part, ok := cache.loadWorld(key, rate); ok {
 			return part, nil
 		}
@@ -393,7 +402,7 @@ func AddChannel(idx *Index, enc encoder.Encoder, cache *PartCache, progress func
 			return result, nil
 		}
 		path := idx.Files[i].Path
-		audio, err := readRecording(path)
+		audio, err := readRecording(path, idx.Files[i].Reversed)
 		if err != nil {
 			return result, fmt.Errorf("%s: %w", path, err)
 		}

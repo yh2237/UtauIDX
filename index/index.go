@@ -34,9 +34,10 @@ type World interface {
 }
 
 type FileEntry struct {
-	Path    string           `json:"path"`
-	Layer   speechpool.Layer `json:"layer"`
-	Penalty float32          `json:"penalty,omitempty"`
+	Path     string           `json:"path"`
+	Layer    speechpool.Layer `json:"layer"`
+	Penalty  float32          `json:"penalty,omitempty"`
+	Reversed bool             `json:"reversed,omitempty"`
 }
 
 type ChannelMeta struct {
@@ -260,15 +261,50 @@ func (idx *Index) resetPacked() {
 	idx.packedStatic, idx.packedDelta = nil, nil
 }
 
+func (idx *Index) reversedFrameMask() (int, []bool) {
+	hasReversed := false
+	for _, f := range idx.Files {
+		if f.Reversed {
+			hasReversed = true
+			break
+		}
+	}
+	if !hasReversed || len(idx.Files) == 0 {
+		return idx.Frames, nil
+	}
+	mask := make([]bool, idx.Frames)
+	forwardCount := 0
+	for f, id := range idx.FileID {
+		if id >= 0 && int(id) < len(idx.Files) && idx.Files[id].Reversed {
+			mask[f] = true
+		} else {
+			forwardCount++
+		}
+	}
+	if forwardCount == 0 {
+		return idx.Frames, nil
+	}
+	return forwardCount, mask
+}
+
 func (idx *Index) computeStatistics() {
-	var positive []float64
-	for _, f := range idx.F0 {
-		if f > 0 {
+	_, revMask := idx.reversedFrameMask()
+	var positive, allPositive []float64
+	for row, f := range idx.F0 {
+		if f <= 0 {
+			continue
+		}
+		allPositive = append(allPositive, float64(f))
+		frame := row / SubFrames
+		if revMask == nil || frame >= len(revMask) || !revMask[frame] {
 			positive = append(positive, float64(f))
 		}
 	}
+	if len(positive) == 0 {
+		positive = allPositive
+	}
 	idx.F0Median = worldcodec.Percentile(positive, 50)
 	idx.computeDerived()
-	idx.C35 = ComputeC35(idx.Spectrum, idx.Voiced)
+	idx.C35 = computeC35Masked(idx.Spectrum, idx.Voiced, revMask)
 	idx.GlitchPenalty = ComputeGlitchPenalties(idx.F0, idx.Aperiodicity, idx.APBands, idx.Voiced, idx.FileID, idx.F0Median)
 }

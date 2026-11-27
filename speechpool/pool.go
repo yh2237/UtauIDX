@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -45,10 +46,47 @@ type Region struct {
 
 // Entry is a recording and its optional oto.ini regions.
 type Entry struct {
-	Path    string
-	Layer   Layer
-	Regions []Region
-	Penalty float32
+	Path     string
+	Layer    Layer
+	Regions  []Region
+	Penalty  float32
+	Reversed bool
+}
+
+// WithReversed appends a time-reversed copy for each non-reversed entry that
+// does not already have a matching reversed copy.
+func WithReversed(entries []Entry) []Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+	type entryKey struct {
+		path    string
+		layer   Layer
+		penalty float32
+	}
+	revCounts := make(map[entryKey]int)
+	for _, entry := range entries {
+		if entry.Reversed {
+			revCounts[entryKey{entry.Path, entry.Layer, entry.Penalty}]++
+		}
+	}
+	out := make([]Entry, len(entries), len(entries)*2)
+	copy(out, entries)
+	for _, entry := range entries {
+		if entry.Reversed {
+			continue
+		}
+		key := entryKey{entry.Path, entry.Layer, entry.Penalty}
+		if revCounts[key] > 0 {
+			revCounts[key]--
+			continue
+		}
+		rev := entry
+		rev.Regions = slices.Clone(entry.Regions)
+		rev.Reversed = true
+		out = append(out, rev)
+	}
+	return out
 }
 
 // BankProfile describes the recordings and their suitability for babble generation.

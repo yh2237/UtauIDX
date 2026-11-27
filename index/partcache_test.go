@@ -82,7 +82,7 @@ func TestPartCacheReusesWorldAndExistingChannels(t *testing.T) {
 		t.Fatalf("region edit: calls %d/%d/%d, positions %v", world.calls.Load(), a.calls.Load(), replace.calls.Load(), updated.Position)
 	}
 
-	worldCacheKey := worldKey(wavBytes, 16000, 20, 120)
+	worldCacheKey := worldKey(wavBytes, 16000, 20, 120, false)
 	if err := os.WriteFile(cache.path(worldCacheKey, "world"), []byte("bad"), 0o600); err != nil {
 		t.Fatal(err)
 	}

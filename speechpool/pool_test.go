@@ -206,3 +206,30 @@ func TestMeasureEntries(t *testing.T) {
 		t.Fatalf("MeasureEntries = (%d, %v), want (120, 2000)", frames, p90)
 	}
 }
+
+func TestWithReversed(t *testing.T) {
+	if got := WithReversed(nil); got != nil {
+		t.Fatalf("WithReversed(nil) = %v, want nil", got)
+	}
+	orig := []Entry{
+		{Path: "a.wav", Layer: LayerRaw, Penalty: 0.14, Regions: []Region{{Offset: 20, Blank: -80}}},
+		{Path: "b.wav", Layer: LayerBabble},
+	}
+	got := WithReversed(orig)
+	if len(got) != 4 {
+		t.Fatalf("len(WithReversed) = %d, want 4", len(got))
+	}
+	if got[0].Reversed || got[1].Reversed || !got[2].Reversed || !got[3].Reversed {
+		t.Fatalf("unexpected reversed flags: %+v", got)
+	}
+	if got[2].Path != "a.wav" || got[2].Layer != LayerRaw || got[2].Penalty != 0.14 || !reflect.DeepEqual(got[2].Regions, orig[0].Regions) {
+		t.Fatalf("reversed entry metadata mismatch: %+v", got[2])
+	}
+	got[2].Regions[0].Offset = 999
+	if orig[0].Regions[0].Offset != 20 {
+		t.Fatal("WithReversed aliased Regions slice")
+	}
+	if again := WithReversed(got); len(again) != 4 {
+		t.Fatalf("WithReversed was not idempotent on reversed entries: len=%d", len(again))
+	}
+}

@@ -324,3 +324,172 @@ func TestModalSampleRateAndRecordingSpan(t *testing.T) {
 		t.Fatalf("span = [%v, %v), want [0, 150)", start, end)
 	}
 }
+
+type sampleCaptureWorld struct {
+	mu      sync.Mutex
+	samples [][]float64
+}
+
+func (w *sampleCaptureWorld) Analyze(samples []float64, rate int, frameMS, threshold float64) ([]float64, []float64, []float64, int, error) {
+	w.mu.Lock()
+	w.samples = append(w.samples, slices.Clone(samples))
+	w.mu.Unlock()
+	const fft = 128
+	const bins = fft/2 + 1
+	rows := len(samples) * 1000 / (rate * int(frameMS))
+	f0 := make([]float64, rows)
+	sp, ap := make([]float64, rows*bins), make([]float64, rows*bins)
+	rev := len(samples) > 0 && samples[0] < 0
+	for row := range rows {
+		f := row / SubFrames
+		if rev {
+			f0[row] = 520
+		} else {
+			f0[row] = 200
+		}
+		for bin := range bins {
+			amp := 2.0
+			if rev {
+				amp = 9.0
+			}
+			sp[row*bins+bin] = math.Exp(math.Sin(float64(bin)/4+float64(f)/2) * amp)
+			ap[row*bins+bin] = 0.1
+		}
+	}
+	return f0, sp, ap, fft, nil
+}
+
+func (*sampleCaptureWorld) Synthesize([]float64, []float64, []float64, int, int, float64) ([]float64, error) {
+	return nil, errors.New("unexpected WORLD synthesis")
+}
+
+type sampleCaptureEncoder struct {
+	id      string
+	dims    int
+	frames  int
+	mu      sync.Mutex
+	samples [][]float32
+}
+
+func (e *sampleCaptureEncoder) ID() string       { return e.id }
+func (e *sampleCaptureEncoder) Dims() int        { return e.dims }
+func (e *sampleCaptureEncoder) FrameMS() float64 { return FrameMS }
+
+func (e *sampleCaptureEncoder) Extract(samples []float32) ([]float32, int, error) {
+	e.mu.Lock()
+	e.samples = append(e.samples, slices.Clone(samples))
+	e.mu.Unlock()
+	return testFeatures(e.frames, e.dims), e.frames, nil
+}
+
+func TestBuildReversedSpanCacheAndAddChannel(t *testing.T) {
+	dir := t.TempDir()
+	const rate = 16000
+	const nSamples = rate * 160 / 1000 // 2560 samples = 160 ms
+	pcm := &wav.PCM{SampleRate: rate, Channels: 1, Data: make([]int16, nSamples)}
+	for i := range nSamples {
+		if i < nSamples/2 {
+			pcm.Data[i] = int16(1000 + i)
+		} else {
+			pcm.Data[i] = int16(-2000 - (i - nSamples/2))
+		}
+	}
+	path := filepath.Join(dir, "asym.wav")
+	if err := wav.WriteFile(path, pcm); err != nil {
+		t.Fatal(err)
+	}
+	entry := speechpool.Entry{
+		Path: path, Layer: speechpool.LayerRaw, Penalty: 0.14,
+		Regions: []speechpool.Region{{Offset: 20, Blank: -80}}, // span [20, 100) ms -> reversed [60, 140) ms
+	}
+	fwdOnly, err := Build([]speechpool.Entry{entry}, &sampleCaptureWorld{}, []encoder.Encoder{&sampleCaptureEncoder{id: "A", dims: 4, frames: 8}}, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache := OpenPartCache(filepath.Join(dir, "parts"))
+	w := &sampleCaptureWorld{}
+	encA := &sampleCaptureEncoder{id: "A", dims: 4, frames: 8}
+	both, err := Build(speechpool.WithReversed([]speechpool.Entry{entry}), w, []encoder.Encoder{encA}, BuildOptions{Cache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(both.Files) != 2 || both.Files[0].Reversed || !both.Files[1].Reversed {
+		t.Fatalf("files = %+v", both.Files)
+	}
+	if len(w.samples) != 2 || len(encA.samples) != 2 {
+		t.Fatalf("expected 2 analyze + 2 extract calls, got %d / %d", len(w.samples), len(encA.samples))
+	}
+	// Because processFiles runs in parallel, sort captured slices by sign of first sample.
+	wFwd, wRev := w.samples[0], w.samples[1]
+	if wFwd[0] < 0 {
+		wFwd, wRev = wRev, wFwd
+	}
+	for i := range nSamples {
+		if math.Abs(wFwd[i]-wRev[nSamples-1-i]) > 1e-12 {
+			t.Fatalf("world sample %d mismatch: fwd=%g rev=%g", i, wFwd[i], wRev[nSamples-1-i])
+		}
+	}
+	eFwd, eRev := encA.samples[0], encA.samples[1]
+	if eFwd[0] < 0 {
+		eFwd, eRev = eRev, eFwd
+	}
+	for i := range nSamples {
+		if eFwd[i] != eRev[nSamples-1-i] {
+			t.Fatalf("encoder sample %d mismatch: fwd=%g rev=%g", i, eFwd[i], eRev[nSamples-1-i])
+		}
+	}
+	if !slices.Equal(both.Position, []int32{1, 2, 3, 4, 3, 4, 5, 6}) {
+		t.Fatalf("positions = %v, want [1 2 3 4 3 4 5 6]", both.Position)
+	}
+	if both.F0Median != fwdOnly.F0Median || math.Abs(both.C35-fwdOnly.C35) > 1e-9 {
+		t.Fatalf("reversed frames altered stats: got F0Med=%v C35=%v, want %v %v",
+			both.F0Median, both.C35, fwdOnly.F0Median, fwdOnly.C35)
+	}
+
+	wavBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worldKey(wavBytes, rate, 20, 100, false) == worldKey(wavBytes, rate, 20, 100, true) ||
+		channelKey(wavBytes, "A", false) == channelKey(wavBytes, "A", true) {
+		t.Fatal("part cache keys collided between forward and reversed")
+	}
+
+	// Second Build reuses PartCache with 0 new calls.
+	w2 := &sampleCaptureWorld{}
+	encA2 := &sampleCaptureEncoder{id: "A", dims: 4, frames: 8}
+	if _, err := Build(speechpool.WithReversed([]speechpool.Entry{entry}), w2, []encoder.Encoder{encA2}, BuildOptions{Cache: cache}); err != nil {
+		t.Fatal(err)
+	}
+	if len(w2.samples) != 0 || len(encA2.samples) != 0 {
+		t.Fatalf("PartCache missed on rebuild: world=%d enc=%d", len(w2.samples), len(encA2.samples))
+	}
+
+	utsp := filepath.Join(dir, "rev.utsp")
+	if err := both.Save(utsp); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(utsp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Files[0].Reversed || !loaded.Files[1].Reversed || !reflect.DeepEqual(loaded.Header, both.Header) {
+		t.Fatalf("Load header mismatch: %+v", loaded.Header)
+	}
+
+	encB := &sampleCaptureEncoder{id: "B", dims: 3, frames: 8}
+	if err := AddChannel(loaded, encB, cache, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(encB.samples) != 2 {
+		t.Fatalf("AddChannel calls = %d, want 2", len(encB.samples))
+	}
+	bFwd, bRev := encB.samples[0], encB.samples[1]
+	if bFwd[0] < 0 {
+		bFwd, bRev = bRev, bFwd
+	}
+	if bFwd[0] != eFwd[0] || bRev[0] != eRev[0] {
+		t.Fatalf("AddChannel did not preserve reversed sample orientation")
+	}
+}

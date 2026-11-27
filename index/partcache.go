@@ -53,12 +53,20 @@ func OpenPartCache(dir string) *PartCache {
 	return &PartCache{dir: dir}
 }
 
-func worldKey(data []byte, targetRate int, startMS, endMS float64) string {
-	return partKey(fmt.Sprintf("world\x00v1\x00%d\x00%g\x00%g\x00", targetRate, startMS, endMS), data)
+func worldKey(data []byte, targetRate int, startMS, endMS float64, reversed bool) string {
+	tag := "world\x00v1\x00"
+	if reversed {
+		tag = "world\x00v1\x00rev\x00"
+	}
+	return partKey(fmt.Sprintf("%s%d\x00%g\x00%g\x00", tag, targetRate, startMS, endMS), data)
 }
 
-func channelKey(data []byte, encoderID string) string {
-	return partKey("chan\x00v1\x00"+encoderID+"\x00", data)
+func channelKey(data []byte, encoderID string, reversed bool) string {
+	tag := "chan\x00v1\x00"
+	if reversed {
+		tag = "chan\x00v1\x00rev\x00"
+	}
+	return partKey(tag+encoderID+"\x00", data)
 }
 
 func partKey(prefix string, data []byte) string {

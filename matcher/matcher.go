@@ -28,6 +28,7 @@ type Options struct {
 	ExtraFilePenalties []float32
 	LayerPenalties     map[speechpool.Layer]float32
 	FramePenalties     []float32
+	ReversedPenalty    *float64
 	SimTemp            float64
 	CandCepSigma       float64
 }
@@ -36,6 +37,7 @@ type Options struct {
 // WORLD rows. SelectedFiles and LayerFrames use 20 ms feature frames.
 type SelectStats struct {
 	Frames, Runs, Switches, UniqueUnits int
+	ReversedFrames                      int
 	MeanRunFrames                       float64
 	SelectedFiles                       []int32
 	LayerFrames                         map[speechpool.Layer]int
@@ -134,6 +136,9 @@ func Match(idx *index.Index, query Query, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("matcher: invalid %s", opt.name)
 		}
 	}
+	if opts.ReversedPenalty != nil && (math.IsNaN(*opts.ReversedPenalty) || *opts.ReversedPenalty < 0 || math.IsInf(*opts.ReversedPenalty, -1)) {
+		return nil, fmt.Errorf("matcher: invalid reversed penalty")
+	}
 	if opts.TopK < 0 || opts.RankDecay > 1 || profile.RankDecay > 1 {
 		return nil, fmt.Errorf("matcher: invalid top K or rank decay")
 	}
@@ -163,7 +168,18 @@ func Match(idx *index.Index, query Query, opts Options) (*Result, error) {
 	sim := make([]float32, blockRows*n)
 	chanSim := make([]float32, len(sim))
 	norm := make([]float32, blockRows*maxDims)
-	penalty := framePenalties(idx, opts, float32(profile.GlitchScale))
+	_, revMask := reversedFrameMask(idx)
+	var skipMask []bool
+	var revPenalty float32
+	switch {
+	case revMask != nil && ((opts.ReversedPenalty == nil && profile.IsSinusoidal) || (opts.ReversedPenalty != nil && math.IsInf(*opts.ReversedPenalty, 1))):
+		skipMask = revMask
+	case opts.ReversedPenalty != nil && !math.IsInf(*opts.ReversedPenalty, 1):
+		revPenalty = float32(*opts.ReversedPenalty)
+	case revMask != nil:
+		revPenalty = float32(DefaultReversedPenalty)
+	}
+	penalty := framePenalties(idx, opts, float32(profile.GlitchScale), revPenalty)
 	var decay []float32
 	if opts.TailPenalty > 0 {
 		decay = bankDecay(idx)
@@ -197,7 +213,7 @@ func Match(idx *index.Index, query Query, opts Options) (*Result, error) {
 			}
 		}
 		for t := start; t < end; t++ {
-			chosen, scores := topCandidates(idx, block, first, last, t, topK, previous, profile)
+			chosen, scores := topCandidates(idx, block, first, last, t, topK, previous, profile, skipMask)
 			result.Nearest[t], result.Scores[t] = chosen, scores
 			result.Weights[t] = blendWeights(chosen, scores, midCep, opts)
 			previous = chosen
@@ -228,10 +244,13 @@ func resolveChannel(idx *index.Index, query Query, id string) (matchChannel, err
 	return ch, nil
 }
 
-func framePenalties(idx *index.Index, opts Options, glitchScale float32) []float32 {
+func framePenalties(idx *index.Index, opts Options, glitchScale, revPenalty float32) []float32 {
 	filePen := make([]float32, len(idx.Files))
 	for i, entry := range idx.Files {
 		filePen[i] = entry.Penalty + opts.LayerPenalties[entry.Layer]
+		if entry.Reversed {
+			filePen[i] += revPenalty
+		}
 		if i < len(opts.ExtraFilePenalties) {
 			filePen[i] += opts.ExtraFilePenalties[i]
 		}
@@ -286,12 +305,15 @@ func bankDecay(idx *index.Index) []float32 {
 	return decay
 }
 
-func topCandidates(idx *index.Index, block []float32, first, last, t, topK int, previous []int, profile AutoProfile) ([]int, []float32) {
+func topCandidates(idx *index.Index, block []float32, first, last, t, topK int, previous []int, profile AutoProfile, skipMask []bool) ([]int, []float32) {
 	n := idx.Frames
 	best := make([]int, 0, topK)
 	scores := make([]float32, 0, topK)
 	cw, bonus := float32(profile.ContextWeight), float32(profile.ContinuityBonus)
 	for j, id := range idx.FileID {
+		if skipMask != nil && j < len(skipMask) && skipMask[j] {
+			continue
+		}
 		score := block[(t-first)*n+j]
 		if cw > 0 {
 			var total, count float32
@@ -396,6 +418,9 @@ func selectionStats(idx *index.Index, nearest [][]int) SelectStats {
 		stats.Frames += worldcodec.SubFrames
 		if id >= 0 && int(id) < len(idx.Files) {
 			stats.LayerFrames[idx.Files[id].Layer]++
+			if idx.Files[id].Reversed {
+				stats.ReversedFrames++
+			}
 		}
 		if previous < 0 {
 			stats.Runs++

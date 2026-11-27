@@ -20,6 +20,7 @@ const (
 	DefaultTopK            = 4
 	DefaultRankDecay       = 0.45
 	DefaultVoicingPenalty  = 0.5
+	DefaultReversedPenalty = 0.02
 	ContextFrames          = 2
 )
 
@@ -52,6 +53,10 @@ type AutoProfile struct {
 // ComputeCos1 returns the mean of the highest bank cosine for each query row.
 // packed must contain indexFrames unit-normalized rows of width dims.
 func ComputeCos1(packed *tensor.PackedB, indexFrames, dims int, queryVals []float32, queryFrames int) float64 {
+	return computeCos1Masked(packed, indexFrames, dims, queryVals, queryFrames, nil)
+}
+
+func computeCos1Masked(packed *tensor.PackedB, indexFrames, dims int, queryVals []float32, queryFrames int, skip []bool) float64 {
 	if packed == nil || indexFrames <= 0 || queryFrames <= 0 || dims <= 0 || queryFrames > len(queryVals)/dims {
 		return 0
 	}
@@ -64,10 +69,60 @@ func ComputeCos1(packed *tensor.PackedB, indexFrames, dims int, queryVals []floa
 		normalizeBlock(norm, queryVals, first, rows, dims)
 		tensor.SGEMMPacked(sim[:rows*indexFrames], norm[:rows*dims], packed, rows, 1)
 		for row := range rows {
-			total += float64(slices.Max(sim[row*indexFrames : (row+1)*indexFrames]))
+			sims := sim[row*indexFrames : (row+1)*indexFrames]
+			if skip == nil {
+				total += float64(slices.Max(sims))
+				continue
+			}
+			best := float32(math.Inf(-1))
+			found := false
+			for j, v := range sims {
+				if j < len(skip) && skip[j] {
+					continue
+				}
+				if !found || v > best {
+					best = v
+					found = true
+				}
+			}
+			if found {
+				total += float64(best)
+			}
 		}
 	}
 	return total / float64(queryFrames)
+}
+
+func reversedFrameMask(idx *index.Index) (int, []bool) {
+	if idx == nil || len(idx.Files) == 0 {
+		if idx == nil {
+			return 0, nil
+		}
+		return idx.Frames, nil
+	}
+	hasReversed := false
+	for _, f := range idx.Files {
+		if f.Reversed {
+			hasReversed = true
+			break
+		}
+	}
+	if !hasReversed {
+		return idx.Frames, nil
+	}
+	mask := make([]bool, idx.Frames)
+	forwardCount := 0
+	for j, id := range idx.FileID {
+		if id >= 0 && int(id) < len(idx.Files) && idx.Files[id].Reversed {
+			mask[j] = true
+		} else {
+			forwardCount++
+		}
+	}
+	if forwardCount == 0 {
+		return idx.Frames, nil
+	}
+	return forwardCount, mask
 }
 
 func normalizeBlock(dst, src []float32, first, rows, dims int) {
@@ -97,18 +152,19 @@ func ComputeAutoProfile(idx *index.Index, query Query) AutoProfile {
 			primary = shared[0]
 		}
 	}
+	forwardFrames, revMask := reversedFrameMask(idx)
 	cos1 := func(id string) float64 {
 		packed, ok := idx.PackedChannel(id)
 		if !ok {
 			return 0
 		}
-		return ComputeCos1(packed, idx.Frames, idx.ChannelDims(id), query.Channels[id], query.Frames)
+		return computeCos1Masked(packed, idx.Frames, idx.ChannelDims(id), query.Channels[id], query.Frames, revMask)
 	}
 	if primary != "" {
 		p.Cos1W6 = cos1(primary)
 	}
 	p.SimGap = clip01((0.57 - p.Cos1W6) / 0.21)
-	p.SizeGap = clip01((4.0 - math.Log10(float64(max(idx.Frames, 500)))) / 0.80)
+	p.SizeGap = clip01((4.0 - math.Log10(float64(max(forwardFrames, 500)))) / 0.80)
 	p.Gap = clip01(p.SimGap + 0.25*p.SizeGap)
 	p.IsSinusoidal = idx.C35 > 1.25
 	p.IsRawPool = !p.IsSinusoidal && isPureRawPool(idx)

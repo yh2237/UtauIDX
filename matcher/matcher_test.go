@@ -324,3 +324,84 @@ func TestComputeAutoProfileRawPool(t *testing.T) {
 	}
 	checkNear(t, got.Weights[0][1]/got.Weights[0][0], 0.20, 1e-12)
 }
+
+func TestReversedPoolProfilePenaltyAndSinusoidalGuard(t *testing.T) {
+	// 1. AutoProfile ignores reversed frames for Cos1 and SizeGap while preserving IsRawPool.
+	fwdIdx := testIndex(2, wavlm)
+	fwdIdx.Files = []index.FileEntry{{Path: "a.wav", Layer: speechpool.LayerRaw}}
+	copy(fwdIdx.Channels[wavlm], []float32{0.6, 0.8, 0.6, 0.8})
+
+	revIdx := testIndex(4, wavlm)
+	revIdx.Files = []index.FileEntry{
+		{Path: "a.wav", Layer: speechpool.LayerRaw},
+		{Path: "a.wav", Layer: speechpool.LayerRaw, Reversed: true},
+	}
+	revIdx.FileID = []int32{0, 0, 1, 1}
+	revIdx.Position = []int32{0, 1, 0, 1}
+	// Reversed frames match query perfectly (1, 0), whereas forward frames are (0.6, 0.8).
+	copy(revIdx.Channels[wavlm], []float32{0.6, 0.8, 0.6, 0.8, 1, 0, 1, 0})
+
+	q := Query{Frames: 1, Channels: map[string][]float32{wavlm: {1, 0}}}
+	pFwd := ComputeAutoProfile(fwdIdx, q)
+	pRev := ComputeAutoProfile(revIdx, q)
+	if !pRev.IsRawPool || math.Abs(pRev.Cos1W6-pFwd.Cos1W6) > 1e-7 || math.Abs(pRev.SizeGap-pFwd.SizeGap) > 1e-9 ||
+		math.Abs(pRev.Gap-pFwd.Gap) > 1e-9 {
+		t.Fatalf("reversed frames skewed AutoProfile: rev=%+v, fwd=%+v", pRev, pFwd)
+	}
+
+	// 2. Default ReversedPenalty (0.02): rejects small gain (< 0.02), accepts clear gain (> 0.02).
+	small := testIndex(2, wavlm)
+	small.Files = []index.FileEntry{
+		{Path: "a.wav", Layer: speechpool.LayerRaw},
+		{Path: "a.wav", Layer: speechpool.LayerRaw, Reversed: true},
+	}
+	small.FileID = []int32{0, 1}
+	// Forward cos = 0.99, Reversed cos = 1.00 (gain = 0.01 < DefaultReversedPenalty).
+	copy(small.Channels[wavlm], []float32{0.99, float32(math.Sqrt(1 - 0.99*0.99)), 1, 0})
+	res, err := Match(small, q, Options{TopK: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Nearest[0][0] != 0 || res.Stats.ReversedFrames != 0 {
+		t.Fatalf("expected forward tie/margin preference, got %v (revFrames=%d)", res.Nearest[0], res.Stats.ReversedFrames)
+	}
+
+	// Larger gain: forward cos = 0.95, reversed cos = 1.00 (gain = 0.05 > DefaultReversedPenalty).
+	copy(small.Channels[wavlm], []float32{0.95, float32(math.Sqrt(1 - 0.95*0.95)), 1, 0})
+	small.ResetPacked()
+	res, err = Match(small, q, Options{TopK: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Nearest[0][0] != 1 || res.Stats.ReversedFrames != 1 {
+		t.Fatalf("expected reversed selection on 0.05 gain, got %v (revFrames=%d)", res.Nearest[0], res.Stats.ReversedFrames)
+	}
+
+	// Explicit +Inf excludes reversed frames on non-sinusoidal bank.
+	inf := math.Inf(1)
+	res, err = Match(small, q, Options{TopK: 2, ReversedPenalty: &inf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Nearest[0]) != 1 || res.Nearest[0][0] != 0 || res.Stats.ReversedFrames != 0 {
+		t.Fatalf("expected +Inf to exclude reversed frames, got %v (revFrames=%d)", res.Nearest[0], res.Stats.ReversedFrames)
+	}
+
+	// 3. Sinusoidal bank excludes reversed frames by default, but allows with explicit finite penalty.
+	small.C35 = 1.30
+	res, err = Match(small, q, Options{TopK: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Nearest[0]) != 1 || res.Nearest[0][0] != 0 || res.Stats.ReversedFrames != 0 {
+		t.Fatalf("sinusoidal default allowed reversed frames: got %v (revFrames=%d)", res.Nearest[0], res.Stats.ReversedFrames)
+	}
+	zero := 0.0
+	res, err = Match(small, q, Options{TopK: 2, ReversedPenalty: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Nearest[0][0] != 1 || res.Stats.ReversedFrames != 1 {
+		t.Fatalf("explicit ReversedPenalty=0 failed on sinusoidal bank: got %v (revFrames=%d)", res.Nearest[0], res.Stats.ReversedFrames)
+	}
+}

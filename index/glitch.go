@@ -2,18 +2,30 @@ package index
 
 import (
 	"math"
-	"slices"
 
 	"github.com/yh2237/UtauIDX/internal/worldcodec"
 )
 
 func ComputeC35(spectrum []float32, voiced []bool) float64 {
+	return computeC35Masked(spectrum, voiced, nil)
+}
+
+func computeC35Masked(spectrum []float32, voiced, skip []bool) float64 {
 	frames := len(spectrum) / (SubFrames * SpectrumDims)
 	voiced = voiced[:min(frames, len(voiced))]
-	voicedOnly := slices.Contains(voiced, true)
+	voicedOnly := false
+	for f, isVoiced := range voiced {
+		if isVoiced && (skip == nil || f >= len(skip) || !skip[f]) {
+			voicedOnly = true
+			break
+		}
+	}
 	var sum float64
 	used := 0
 	for f := range frames {
+		if skip != nil && f < len(skip) && skip[f] {
+			continue
+		}
 		if voicedOnly && (f >= len(voiced) || !voiced[f]) {
 			continue
 		}
